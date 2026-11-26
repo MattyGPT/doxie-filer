@@ -1,0 +1,22 @@
+[
+  {
+    "id": "rule-healthcare-receipts",
+    "name": "Healthcare & Pharmacy Receipts",
+    "when": "Medical, dental, lab, or pharmacy payment receipts and bills",
+    "keywords": ["pharmacy receipt", "copay", "amount paid", "patient responsibility"],
+    "person": null,
+    "folder": "Shared/Health/Receipts/{YEAR}",
+    "enabled": true,
+    "source": "example"
+  },
+  {
+    "id": "rule-auto-insurance",
+    "name": "Auto Insurance Policies",
+    "when": "Vehicle insurance policy summaries, renewal notices, and ID cards",
+    "keywords": ["auto insurance", "policy declarations", "financial responsibility"],
+    "person": null,
+    "folder": "Shared/Auto/Insurance",
+    "enabled": true,
+    "source": "example"
+  }
+]

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Doxie Filer
+GenericName=Document Filer
+Comment=Review local AI folder recommendations and file scanned PDFs
+Exec=doxie filer
+Icon=folder-documents
+Terminal=false
+Type=Application
+Categories=Office;Utility;
+Keywords=Doxie;Filer;Scan;PDF;Sort;OCR;
+StartupNotify=true
+StartupWMClass=chrome-127.0.0.1__-Default

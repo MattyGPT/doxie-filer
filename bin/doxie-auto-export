@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""Auto-export Doxie Pro scans & normalize incoming Canon/external scans into searchable PDFs."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+ENV_FILE = Path.home() / ".config" / "doxie-scanner" / "env"
+STATE_FILE = Path.home() / ".local" / "share" / "doxie-scanner" / "exported.json"
+DEFAULT_LISTEN = "127.0.0.1:8400"
+DEFAULT_PDF_DIR = Path.home() / "Scans"
+DEFAULT_CANON_DEVICE = ""
+FALLBACK_SOURCE = "doxie-pro"
+CANON_FALLBACK_SOURCE = "network-scan"
+
+INCOMING_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+NORMALIZED_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_.+\.pdf$", re.IGNORECASE)
+
+GENERIC_DOMAINS = {
+    "gmail", "yahoo", "outlook", "hotmail", "icloud", "aol", "live", "msn",
+    "me", "mac", "proton", "protonmail", "pm", "comcast", "verizon", "att",
+    "example", "localhost", "w3", "schema", "apple", "google", "microsoft",
+}
+
+ORG_STOP_PREFIXES = {
+    "the", "a", "an", "to", "of", "for", "by", "at", "in", "on", "from", "with",
+    "your", "our", "my", "this", "that", "these", "those", "any", "other",
+    "primary", "patient", "federal", "local", "public", "private",
+    "notice", "privacy", "vaccine", "consent", "information", "administration",
+    "provided", "received", "signed", "certified", "authorized", "regarding",
+    "including", "following", "electronic", "written", "medical", "personal",
+    "please", "contact", "call", "visit", "see", "read", "use", "copy", "all",
+    "if", "or", "and", "as", "is", "are", "be", "will", "may", "can", "not",
+}
+
+ORG_SUFFIX_RE = re.compile(
+    r"\b("
+    r"(?:[A-Z][A-Za-z0-9&'.-]*(?:\s+(?:of|and|&|[A-Z][A-Za-z0-9&'.-]*)){0,3})\s+"
+    r"(?:Pharmacy|Pharmacies|Health|Healthcare|Hospital|Medical\s+Center|Medical\s+Group|"
+    r"Clinic|Bank|Credit\s+Union|Financial|Insurance|Mortgage|Energy|Electric|Gas|"
+    r"Water|Utilities|Utility|Wireless|Telecom|Communications|University|College|"
+    r"School|Church|Ministry|Associates|Partners|Foundation|Laboratories|Labs|"
+    r"Diagnostics|Inc\.?|LLC|Corp\.?|Corporation|Company)"
+    r")\b"
+)
+
+TRADEMARK_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9&'-]+(?:\s+[A-Z][A-Za-z0-9&'-]+){0,2})\s*[®™]"
+)
+
+DOMAIN_RE = re.compile(
+    r"\b(?:https?://|www\.|[A-Za-z0-9._%+-]+@)([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)\b",
+    re.IGNORECASE,
+)
+
+HEADER_SKIP_RE = re.compile(
+    r"^(?:page\s+\d+|date\b|patient\b|last\s+name|first\s+name|address\b|phone\b|"
+    r"tel\b|fax\b|store\b|rx\b|account\b|invoice\s*#|order\s*#|statement\s+date|"
+    r"select\s+what|please\s+|consent\s+for|\d+[/.-]\d+[/.-]\d+)",
+    re.IGNORECASE,
+)
+
+
+def load_env_file() -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not ENV_FILE.is_file():
+        return vals
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        vals[k.strip()] = v.strip().strip('"').strip("'")
+    return vals
+
+
+def is_truthy(val: str | None, default: bool = True) -> bool:
+    if val is None or val == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_config() -> dict[str, Any]:
+    env = load_env_file()
+    addr = os.environ.get("DOXIE_URL") or env.get("DOXIE_LISTEN_ADDR", DEFAULT_LISTEN)
+    if addr.startswith(":"):
+        addr = f"127.0.0.1{addr}"
+    elif addr.startswith("0.0.0.0:"):
+        addr = "127.0.0.1:" + addr.split(":", 1)[1]
+    if not addr.startswith("http://") and not addr.startswith("https://"):
+        addr = f"http://{addr}"
+
+    pdf_dir = Path(os.environ.get("DOXIE_PDF_DIR") or env.get("DOXIE_PDF_DIR") or DEFAULT_PDF_DIR).expanduser()
+    ocr_lang = os.environ.get("DOXIE_OCR_LANG") or env.get("DOXIE_OCR_LANG", "eng")
+    jpeg_quality = int(os.environ.get("DOXIE_PDF_JPEG_QUALITY") or env.get("DOXIE_PDF_JPEG_QUALITY", "88"))
+    poll_sec = float(os.environ.get("DOXIE_AUTO_EXPORT_POLL_SEC") or env.get("DOXIE_AUTO_EXPORT_POLL_SEC", "2"))
+    watch_incoming = is_truthy(os.environ.get("DOXIE_WATCH_INCOMING") or env.get("DOXIE_WATCH_INCOMING"), default=True)
+    canon_device = os.environ.get("DOXIE_CANON_DEVICE") or env.get("DOXIE_CANON_DEVICE") or DEFAULT_CANON_DEVICE
+
+    return {
+        "base_url": addr.rstrip("/"),
+        "pdf_dir": pdf_dir,
+        "ocr_lang": ocr_lang,
+        "jpeg_quality": max(50, min(100, jpeg_quality)),
+        "poll_sec": max(0.5, poll_sec),
+        "watch_incoming": watch_incoming,
+        "canon_device": canon_device,
+    }
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def http_get(base_url: str, path: str, timeout: float = 60.0) -> bytes:
+    req = urllib.request.Request(f"{base_url}{path}", method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def http_get_json(base_url: str, path: str, timeout: float = 30.0) -> Any:
+    return json.loads(http_get(base_url, path, timeout=timeout).decode("utf-8"))
+
+
+def slugify(value: str, max_len: int = 40) -> str:
+    s = value.lower().strip()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    if len(s) > max_len:
+        cut = s[:max_len].rsplit("-", 1)[0]
+        s = cut if len(cut) >= 6 else s[:max_len].strip("-")
+    return s
+
+
+def clean_org_candidate(raw: str) -> str | None:
+    tokens = raw.strip().rstrip(".,").split()
+    while tokens and tokens[0].lower().strip(".,") in ORG_STOP_PREFIXES:
+        tokens.pop(0)
+    if len(tokens) < 2:
+        return None
+    if len(tokens) >= 3 and tokens[-1].lower().rstrip(".") in ("inc", "llc", "corp", "corporation", "co", "company"):
+        tokens.pop()
+    cand = " ".join(tokens)
+    letters = sum(c.isalpha() for c in cand)
+    if letters < 4:
+        return None
+    return cand
+
+
+def detect_document_source(text: str, fallback: str = FALLBACK_SOURCE) -> str:
+    """Extract a clean filename slug for the document's source/organization from OCR text."""
+    if not text or not text.strip():
+        return fallback
+
+    org_counts: collections.Counter[str] = collections.Counter()
+    org_first_pos: dict[str, int] = {}
+    for m in ORG_SUFFIX_RE.finditer(text):
+        cleaned = clean_org_candidate(m.group(1))
+        if not cleaned:
+            continue
+        slug = slugify(cleaned)
+        if not slug or len(slug) < 3:
+            continue
+        org_counts[slug] += 1
+        if slug not in org_first_pos:
+            org_first_pos[slug] = m.start()
+
+    if org_counts:
+        return min(
+            org_counts.keys(),
+            key=lambda s: (-org_counts[s], org_first_pos[s], len(s)),
+        )
+
+    domain_counts: collections.Counter[str] = collections.Counter()
+    for m in DOMAIN_RE.finditer(text):
+        host = m.group(1).lower().strip(".")
+        parts = [p for p in host.split(".") if p and p != "www"]
+        if len(parts) < 2:
+            continue
+        brand = parts[-2]
+        if brand in ("co", "com", "org", "net", "gov", "edu") and len(parts) >= 3:
+            brand = parts[-3]
+        if brand in GENERIC_DOMAINS or len(brand) < 2 or brand.isdigit():
+            continue
+        slug = slugify(brand)
+        if slug:
+            domain_counts[slug] += 1
+    if domain_counts:
+        return domain_counts.most_common(1)[0][0]
+
+    tm_counts: collections.Counter[str] = collections.Counter()
+    for m in TRADEMARK_RE.finditer(text):
+        raw = m.group(1).strip()
+        words = [w for w in raw.split() if w.lower() not in ORG_STOP_PREFIXES]
+        if not words:
+            continue
+        slug = slugify(" ".join(words))
+        if slug and len(slug) >= 2:
+            tm_counts[slug] += 1
+    if tm_counts:
+        return tm_counts.most_common(1)[0][0]
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines[:10]:
+        if HEADER_SKIP_RE.match(ln):
+            continue
+        if ":" in ln or len(ln) > 70:
+            continue
+        letters = sum(c.isalpha() for c in ln)
+        if letters < 5 or (letters / max(len(ln), 1)) < 0.65:
+            continue
+        words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9&'-]*", ln) if len(w) >= 2]
+        if len(words) >= 2:
+            slug = slugify(" ".join(words[:4]))
+            if slug and len(slug) >= 4:
+                return slug
+
+    return fallback
+
+
+def parse_local_timestamp(created_at: str) -> str:
+    try:
+        parsed = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        local_dt = parsed.astimezone()
+    except Exception:
+        local_dt = dt.datetime.now()
+    return local_dt.strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def load_state() -> dict[str, Any]:
+    default = {"exported": {}, "known_hashes": {}}
+    if not STATE_FILE.is_file():
+        return default
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            data.setdefault("exported", {})
+            data.setdefault("known_hashes", {})
+            return data
+    except Exception:
+        pass
+    return default
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Keep known_hashes bounded
+    kh = state.get("known_hashes")
+    if isinstance(kh, dict) and len(kh) > 1000:
+        keep = sorted(kh.keys(), key=lambda k: kh[k].get("seenAt", ""), reverse=True)[:800]
+        state["known_hashes"] = {k: kh[k] for k in keep}
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, STATE_FILE)
+
+
+def record_known_file(path: Path, source: str, origin: str) -> None:
+    state = load_state()
+    fhash = sha256_file(path)
+    state["known_hashes"][fhash] = {
+        "name": path.name,
+        "source": source,
+        "origin": origin,
+        "seenAt": dt.datetime.now().astimezone().isoformat(),
+    }
+    save_state(state)
+
+
+def unique_path(directory: Path, stem: str, ext: str = ".pdf") -> Path:
+    candidate = directory / f"{stem}{ext}"
+    if not candidate.exists():
+        return candidate
+    for i in range(2, 1000):
+        candidate = directory / f"{stem}-{i}{ext}"
+        if not candidate.exists():
+            return candidate
+    return directory / f"{stem}-{int(time.time())}{ext}"
+
+
+def notify(title: str, body: str) -> None:
+    if shutil.which("notify-send"):
+        subprocess.run(
+            ["notify-send", "-a", "Doxie Scanner", "-i", "scanner", title, body],
+            check=False,
+        )
+
+
+def pdf_text_preview(pdf_path: Path, max_pages: int = 2) -> str:
+    if not shutil.which("pdftotext"):
+        return ""
+    proc = subprocess.run(
+        ["pdftotext", "-l", str(max_pages), str(pdf_path), "-"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (proc.stdout or "").strip()
+
+
+def pdf_page_count(pdf_path: Path) -> int:
+    if not shutil.which("pdfinfo"):
+        return 1
+    proc = subprocess.run(["pdfinfo", str(pdf_path)], capture_output=True, text=True, check=False)
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("Pages:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    return 1
+
+
+def images_to_searchable_pdf(
+    image_paths: list[Path],
+    out_pdf_base: Path,
+    dpi: int,
+    ocr_lang: str,
+    quality: int,
+    tmp_dir: Path,
+) -> Path:
+    list_lines: list[str] = []
+    for idx, src_img in enumerate(image_paths, start=1):
+        jpg_path = tmp_dir / f"norm-{idx:03d}.jpg"
+        if shutil.which("magick"):
+            subprocess.run(
+                [
+                    "magick",
+                    str(src_img),
+                    "-background", "white",
+                    "-alpha", "remove",
+                    "-alpha", "off",
+                    "-units", "PixelsPerInch",
+                    "-density", str(dpi),
+                    "-quality", str(quality),
+                    str(jpg_path),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            list_lines.append(str(jpg_path))
+        else:
+            list_lines.append(str(src_img))
+
+    list_file = tmp_dir / "pages.txt"
+    list_file.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+    subprocess.run(
+        [
+            "tesseract",
+            str(list_file),
+            str(out_pdf_base),
+            "--dpi", str(dpi),
+            "-l", ocr_lang,
+            "pdf",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return out_pdf_base.with_suffix(".pdf")
+
+
+def export_searchable_pdf(
+    cfg: dict[str, Any],
+    job_id: str,
+    explicit_out: Path | None = None,
+    send_notification: bool = False,
+) -> tuple[Path, str, int]:
+    base_url = cfg["base_url"]
+    detail = http_get_json(base_url, f"/api/scans/{job_id}")
+    pages = detail.get("pages") or []
+    if not pages:
+        raise RuntimeError(f"scan {job_id} has no pages")
+
+    dpi = int(detail.get("dpi") or 300)
+    ocr_lang = cfg["ocr_lang"]
+    quality = cfg["jpeg_quality"]
+
+    with tempfile.TemporaryDirectory(prefix="doxie-pdf-") as tmp:
+        tmp_dir = Path(tmp)
+        raw_imgs: list[Path] = []
+        for idx, page in enumerate(pages, start=1):
+            page_num = page["index"]
+            png_bytes = http_get(base_url, f"/api/scans/{job_id}/pages/{page_num}", timeout=120.0)
+            png_path = tmp_dir / f"page-{idx:03d}.png"
+            png_path.write_bytes(png_bytes)
+            raw_imgs.append(png_path)
+
+        pdf_tmp = images_to_searchable_pdf(
+            raw_imgs,
+            tmp_dir / "searchable",
+            dpi=dpi,
+            ocr_lang=ocr_lang,
+            quality=quality,
+            tmp_dir=tmp_dir,
+        )
+
+        ocr_text = pdf_text_preview(pdf_tmp, max_pages=2)
+        source = detect_document_source(ocr_text, fallback=FALLBACK_SOURCE)
+
+        if explicit_out is not None:
+            if explicit_out.is_dir() or str(explicit_out).endswith("/"):
+                explicit_out.mkdir(parents=True, exist_ok=True)
+                ts = parse_local_timestamp(detail.get("createdAt", ""))
+                dest = unique_path(explicit_out, f"{ts}_{source}")
+            else:
+                explicit_out.parent.mkdir(parents=True, exist_ok=True)
+                dest = explicit_out
+        else:
+            pdf_dir: Path = cfg["pdf_dir"]
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            ts = parse_local_timestamp(detail.get("createdAt", ""))
+            dest = unique_path(pdf_dir, f"{ts}_{source}")
+
+        staged = dest.parent / f".{dest.name}.tmp.{os.getpid()}"
+        shutil.copyfile(pdf_tmp, staged)
+        os.replace(staged, dest)
+
+    state = load_state()
+    fhash = sha256_file(dest)
+    state["exported"][job_id] = {
+        "pdf": str(dest),
+        "source": source,
+        "pageCount": len(pages),
+        "exportedAt": dt.datetime.now().astimezone().isoformat(),
+    }
+    state["known_hashes"][fhash] = {
+        "name": dest.name,
+        "source": source,
+        "origin": "doxie-pro",
+        "seenAt": dt.datetime.now().astimezone().isoformat(),
+    }
+    save_state(state)
+
+    if send_notification:
+        notify(
+            "Doxie Scan Saved",
+            f"{dest.name} ({len(pages)} page{'s' if len(pages) != 1 else ''})",
+        )
+
+    return dest, source, len(pages)
+
+
+def normalize_incoming_file(
+    cfg: dict[str, Any],
+    src_path: Path,
+    send_notification: bool = True,
+) -> tuple[Path, str, int, bool]:
+    """Ensure an incoming scanner/external file in the inbox is a searchable, cleanly named PDF."""
+    ext = src_path.suffix.lower()
+    ocr_lang = cfg["ocr_lang"]
+    quality = cfg["jpeg_quality"]
+    mtime_ts = dt.datetime.fromtimestamp(src_path.stat().st_mtime).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+
+    with tempfile.TemporaryDirectory(prefix="canon-ingest-") as tmp:
+        tmp_dir = Path(tmp)
+        did_ocr = False
+
+        if ext == ".pdf":
+            existing_text = pdf_text_preview(src_path, max_pages=2)
+            if len(existing_text) >= 40:
+                # Already has an OCR/text layer
+                if NORMALIZED_NAME_RE.match(src_path.name):
+                    # Already normalized (e.g., restored via undo) — just remember its hash
+                    record_known_file(src_path, "existing", "already-normalized")
+                    return src_path, "existing", pdf_page_count(src_path), False
+                working_pdf = src_path
+                ocr_text = existing_text
+            else:
+                # Image-only PDF (typical Canon scan): rasterize pages at 300 DPI and build searchable PDF
+                prefix = tmp_dir / "pg"
+                if shutil.which("pdftoppm"):
+                    subprocess.run(
+                        [
+                            "pdftoppm",
+                            "-jpeg",
+                            "-jpegopt", f"quality={quality}",
+                            "-r", "300",
+                            str(src_path),
+                            str(prefix),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    rendered = sorted(tmp_dir.glob("pg-*.jpg"))
+                else:
+                    subprocess.run(
+                        ["magick", "-density", "300", str(src_path), "-background", "white", "-alpha", "remove", str(tmp_dir / "pg-%03d.jpg")],
+                        check=True,
+                        capture_output=True,
+                    )
+                    rendered = sorted(tmp_dir.glob("pg-*.jpg"))
+                if not rendered:
+                    raise RuntimeError(f"Could not render any pages from {src_path.name}")
+                list_file = tmp_dir / "pages.txt"
+                list_file.write_text("\n".join(str(p) for p in rendered) + "\n", encoding="utf-8")
+                out_base = tmp_dir / "searchable"
+                subprocess.run(
+                    ["tesseract", str(list_file), str(out_base), "--dpi", "300", "-l", ocr_lang, "pdf"],
+                    check=True,
+                    capture_output=True,
+                )
+                working_pdf = out_base.with_suffix(".pdf")
+                ocr_text = pdf_text_preview(working_pdf, max_pages=2)
+                did_ocr = True
+        else:
+            # Image scan (JPEG/PNG/TIFF) -> 300 DPI searchable PDF
+            working_pdf = images_to_searchable_pdf(
+                [src_path],
+                tmp_dir / "searchable",
+                dpi=300,
+                ocr_lang=ocr_lang,
+                quality=quality,
+                tmp_dir=tmp_dir,
+            )
+            ocr_text = pdf_text_preview(working_pdf, max_pages=2)
+            did_ocr = True
+
+        source = detect_document_source(ocr_text, fallback=CANON_FALLBACK_SOURCE)
+        pages = pdf_page_count(working_pdf)
+
+        if NORMALIZED_NAME_RE.match(src_path.name) and working_pdf != src_path:
+            # Keep same normalized filename, replace with searchable PDF atomically
+            dest = src_path
+        else:
+            dest = unique_path(src_path.parent, f"{mtime_ts}_{source}")
+
+        staged = dest.parent / f".{dest.name}.tmp.{os.getpid()}"
+        shutil.copyfile(working_pdf, staged)
+        os.replace(staged, dest)
+
+        if dest.resolve() != src_path.resolve() and src_path.exists():
+            src_path.unlink()
+
+    record_known_file(dest, source, "incoming-canon")
+
+    if send_notification:
+        notify(
+            "Scan Ready in Inbox",
+            f"{dest.name} ({pages} page{'s' if pages != 1 else ''})",
+        )
+
+    return dest, source, pages, did_ocr
+
+
+def scan_from_canon(
+    cfg: dict[str, Any],
+    source_tray: str = "ADF Duplex",
+    mode: str = "Color",
+    dpi: int = 300,
+    explicit_out: Path | None = None,
+) -> tuple[Path, str, int]:
+    """Pull a scan directly from a network eSCL/SANE scanner."""
+    device = cfg["canon_device"]
+    if not device:
+        raise RuntimeError("No network scanner configured. Set DOXIE_CANON_DEVICE in ~/.config/doxie-scanner/env (find yours with `scanimage -L`).")
+    ocr_lang = cfg["ocr_lang"]
+    quality = cfg["jpeg_quality"]
+
+    with tempfile.TemporaryDirectory(prefix="canon-escl-") as tmp:
+        tmp_dir = Path(tmp)
+        print(f"Scanning from Canon ({device}, source={source_tray}, mode={mode}, {dpi} DPI)...", file=sys.stderr)
+        if source_tray == "Flatbed":
+            out_img = tmp_dir / "page-001.png"
+            cmd = [
+                "scanimage",
+                "-d", device,
+                "--source", "Flatbed",
+                "--mode", mode,
+                "--resolution", str(dpi),
+                "--format=png",
+                "-o", str(out_img),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "scanimage failed")
+            pages_imgs = [out_img] if out_img.is_file() and out_img.stat().st_size > 0 else []
+        else:
+            batch_tpl = str(tmp_dir / "page-%03d.png")
+            cmd = [
+                "scanimage",
+                "-d", device,
+                "--source", source_tray,
+                "--mode", mode,
+                "--resolution", str(dpi),
+                "--format=png",
+                f"--batch={batch_tpl}",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            pages_imgs = sorted(p for p in tmp_dir.glob("page-*.png") if p.stat().st_size > 0)
+            if not pages_imgs:
+                raise RuntimeError(proc.stderr.strip() or "No pages scanned (is paper loaded in the Canon ADF?)")
+
+        pdf_tmp = images_to_searchable_pdf(
+            pages_imgs,
+            tmp_dir / "searchable",
+            dpi=dpi,
+            ocr_lang=ocr_lang,
+            quality=quality,
+            tmp_dir=tmp_dir,
+        )
+        ocr_text = pdf_text_preview(pdf_tmp, max_pages=2)
+        source_slug = detect_document_source(ocr_text, fallback=CANON_FALLBACK_SOURCE)
+        ts = dt.datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+
+        if explicit_out is not None:
+            if explicit_out.is_dir() or str(explicit_out).endswith("/"):
+                explicit_out.mkdir(parents=True, exist_ok=True)
+                dest = unique_path(explicit_out, f"{ts}_{source_slug}")
+            else:
+                explicit_out.parent.mkdir(parents=True, exist_ok=True)
+                dest = explicit_out
+        else:
+            pdf_dir: Path = cfg["pdf_dir"]
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            dest = unique_path(pdf_dir, f"{ts}_{source_slug}")
+
+        staged = dest.parent / f".{dest.name}.tmp.{os.getpid()}"
+        shutil.copyfile(pdf_tmp, staged)
+        os.replace(staged, dest)
+
+    record_known_file(dest, source_slug, "canon-escl")
+    notify("Canon Scan Saved", f"{dest.name} ({len(pages_imgs)} page{'s' if len(pages_imgs) != 1 else ''})")
+    return dest, source_slug, len(pages_imgs)
+
+
+def is_temp_or_hidden(path: Path) -> bool:
+    name = path.name
+    low = name.lower()
+    if name.startswith("."):
+        return True
+    if low.endswith((".!sync", ".rsls", ".tmp", ".part", ".crdownload")):
+        return True
+    return False
+
+
+def watch_loop(cfg: dict[str, Any]) -> int:
+    pdf_dir: Path = cfg["pdf_dir"]
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"doxie-auto-export watching {cfg['base_url']} + inbox {pdf_dir} "
+        f"(watch_incoming={cfg['watch_incoming']}, lang={cfg['ocr_lang']}, quality={cfg['jpeg_quality']})",
+        flush=True,
+    )
+    failed_jobs: dict[str, int] = {}
+    failed_files: dict[str, int] = {}
+    # Tracks (size, mtime_ns, stable_ticks) for incoming files so we wait until sync/SMB finishes writing
+    pending_files: dict[str, tuple[int, int, int]] = {}
+
+    while True:
+        # 1. Watch Doxie Pro daemon for newly completed scans
+        try:
+            scans = http_get_json(cfg["base_url"], "/api/scans", timeout=10.0)
+            state = load_state()
+            exported = state["exported"]
+
+            for s in reversed(scans):
+                job_id = s.get("id")
+                if not job_id or s.get("status") != "completed" or (s.get("pageCount") or 0) <= 0:
+                    continue
+                if job_id in exported or failed_jobs.get(job_id, 0) >= 3:
+                    continue
+                try:
+                    dest, source, count = export_searchable_pdf(cfg, job_id, send_notification=True)
+                    print(f"exported doxie {job_id} ({count} pages, source={source}) -> {dest}", flush=True)
+                    failed_jobs.pop(job_id, None)
+                except Exception as exc:
+                    failed_jobs[job_id] = failed_jobs.get(job_id, 0) + 1
+                    print(f"error exporting {job_id} (attempt {failed_jobs[job_id]}): {exc}", file=sys.stderr, flush=True)
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            pass
+        except Exception as exc:
+            print(f"doxie watch error: {exc}", file=sys.stderr, flush=True)
+
+        # 2. Watch inbox folder for external/network scans needing OCR or source-naming
+        if cfg["watch_incoming"] and pdf_dir.is_dir():
+            try:
+                state = load_state()
+                known_hashes = state["known_hashes"]
+                current_paths: set[str] = set()
+
+                for p in sorted(pdf_dir.iterdir()):
+                    if not p.is_file() or is_temp_or_hidden(p) or p.suffix.lower() not in INCOMING_EXTS:
+                        continue
+                    key = str(p)
+                    current_paths.add(key)
+                    if failed_files.get(key, 0) >= 3:
+                        continue
+                    try:
+                        st = p.stat()
+                    except FileNotFoundError:
+                        continue
+                    if st.st_size == 0:
+                        continue
+
+                    prev = pending_files.get(key)
+                    if prev and prev[0] == st.st_size and prev[1] == st.st_mtime_ns:
+                        ticks = prev[2] + 1
+                    else:
+                        ticks = 1
+                    pending_files[key] = (st.st_size, st.st_mtime_ns, ticks)
+
+                    # Require 2 stable polls (~4s) before touching incoming synced files
+                    if ticks < 2:
+                        continue
+
+                    fhash = sha256_file(p)
+                    if fhash in known_hashes:
+                        continue
+
+                    try:
+                        dest, source, count, did_ocr = normalize_incoming_file(cfg, p, send_notification=True)
+                        print(
+                            f"normalized incoming {p.name} ({count} pages, ocr={did_ocr}, source={source}) -> {dest.name}",
+                            flush=True,
+                        )
+                        pending_files.pop(key, None)
+                        failed_files.pop(key, None)
+                    except Exception as exc:
+                        failed_files[key] = failed_files.get(key, 0) + 1
+                        print(f"error normalizing {p.name} (attempt {failed_files[key]}): {exc}", file=sys.stderr, flush=True)
+
+                for stale in list(pending_files.keys()):
+                    if stale not in current_paths:
+                        pending_files.pop(stale, None)
+            except Exception as exc:
+                print(f"incoming watch error: {exc}", file=sys.stderr, flush=True)
+
+        time.sleep(cfg["poll_sec"])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Auto-export Doxie Pro & Canon scans as searchable PDFs.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--watch", action="store_true", help="Continuously watch Doxie Pro and the Scans inbox")
+    mode.add_argument("--job", help="Export one specific Doxie scan ID (or 'latest') immediately")
+    mode.add_argument("--canon", action="store_true", help="Pull a scan from the network Canon MF750C II via eSCL")
+    mode.add_argument("--normalize", help="Normalize/OCR a specific PDF or image file in-place")
+    parser.add_argument("-o", "--out", help="Output file or directory")
+    parser.add_argument("--source", default="ADF Duplex", choices=["ADF Duplex", "ADF", "Flatbed"], help="Canon scan source")
+    parser.add_argument("--mode", default="Color", choices=["Color", "Gray"], help="Canon color mode")
+    parser.add_argument("--dpi", type=int, default=300, choices=[150, 300], help="Canon resolution")
+    parser.add_argument("--notify", action="store_true", help="Send desktop notification on completion")
+    args = parser.parse_args()
+
+    cfg = get_config()
+    if args.watch:
+        return watch_loop(cfg)
+
+    if args.canon:
+        dest, source, count = scan_from_canon(
+            cfg,
+            source_tray=args.source,
+            mode=args.mode,
+            dpi=args.dpi,
+            explicit_out=Path(args.out).expanduser() if args.out else None,
+        )
+        print(f"{dest}")
+        print(f"Detected source: {source} ({count} pages, searchable PDF)", file=sys.stderr)
+        return 0
+
+    if args.normalize:
+        dest, source, count, did_ocr = normalize_incoming_file(
+            cfg,
+            Path(args.normalize).expanduser().resolve(),
+            send_notification=args.notify,
+        )
+        print(f"{dest}")
+        print(f"Detected source: {source} ({count} pages, ocr={did_ocr})", file=sys.stderr)
+        return 0
+
+    job_id = args.job
+    if job_id == "latest":
+        scans = http_get_json(cfg["base_url"], "/api/scans")
+        if not scans:
+            raise SystemExit("Error: no scans found.")
+        job_id = scans[0]["id"]
+
+    dest, source, count = export_searchable_pdf(
+        cfg,
+        job_id,
+        explicit_out=Path(args.out).expanduser() if args.out else None,
+        send_notification=args.notify,
+    )
+    print(f"{dest}")
+    print(f"Detected source: {source} ({count} pages, searchable PDF)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

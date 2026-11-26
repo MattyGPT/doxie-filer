@@ -1,0 +1,1272 @@
+#!/usr/bin/env python3
+"""CLI for the Doxie Pro DX400 scanner (talks to the local doxie-scanner daemon)."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+ENV_FILE = Path.home() / ".config" / "doxie-scanner" / "env"
+DEFAULT_LISTEN = "127.0.0.1:8400"
+SERVICE_NAME = "doxie-scanner.service"
+AUTO_EXPORT_SERVICE = "doxie-auto-export.service"
+FILER_SERVICE = "doxie-filer.service"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FILER_LIB_DIR = Path.home() / ".local" / "share" / "doxie-filer"
+DOXIE_VID = "2740"
+DOXIE_PID = "000c"
+
+
+def load_env_file() -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not ENV_FILE.is_file():
+        return vals
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        vals[k.strip()] = v.strip().strip('"').strip("'")
+    return vals
+
+
+def default_base_url() -> str:
+    if env_url := os.environ.get("DOXIE_URL"):
+        return env_url.rstrip("/")
+    env = load_env_file()
+    addr = env.get("DOXIE_LISTEN_ADDR", DEFAULT_LISTEN)
+    if addr.startswith(":"):
+        addr = f"127.0.0.1{addr}"
+    elif addr.startswith("0.0.0.0:"):
+        addr = "127.0.0.1:" + addr.split(":", 1)[1]
+    if not addr.startswith("http://") and not addr.startswith("https://"):
+        addr = f"http://{addr}"
+    return addr.rstrip("/")
+
+
+class ApiError(RuntimeError):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+class Client:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
+    def request_raw(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        timeout: float = 120.0,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        url = f"{self.base_url}{path}"
+        data = None
+        headers = {}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read(), dict(resp.headers.items())
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            code = "http_error"
+            msg = raw.decode("utf-8", errors="replace").strip() or e.reason
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                    code = payload["error"].get("code", code)
+                    msg = payload["error"].get("message", msg)
+                elif isinstance(payload, dict) and payload.get("status") == "running":
+                    code = "scan_running"
+                    msg = f"a scan is already running (job {payload.get('jobId', 'unknown')})"
+            except Exception:
+                pass
+            raise ApiError(e.code, code, msg) from None
+        except urllib.error.URLError as e:
+            raise SystemExit(
+                f"Error: cannot reach doxie-scanner daemon at {self.base_url} ({e.reason}).\n"
+                f"Try: doxie service status  or  doxie service start"
+            ) from None
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        timeout: float = 120.0,
+    ) -> Any:
+        _, raw, _ = self.request_raw(method, path, body=body, timeout=timeout)
+        if not raw:
+            return None
+        return json.loads(raw.decode("utf-8"))
+
+
+def find_usb_device() -> dict[str, Any] | None:
+    for devdir in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        vid_p = Path(devdir) / "idVendor"
+        pid_p = Path(devdir) / "idProduct"
+        if not (vid_p.is_file() and pid_p.is_file()):
+            continue
+        vid = vid_p.read_text().strip().lower()
+        pid = pid_p.read_text().strip().lower()
+        if vid == DOXIE_VID and pid == DOXIE_PID:
+            bus = int((Path(devdir) / "busnum").read_text().strip())
+            dev = int((Path(devdir) / "devnum").read_text().strip())
+            node = Path(f"/dev/bus/usb/{bus:03d}/{dev:03d}")
+            product = (
+                (Path(devdir) / "product").read_text().strip()
+                if (Path(devdir) / "product").is_file()
+                else "Doxie Pro"
+            )
+            return {
+                "sysfs": devdir,
+                "node": str(node),
+                "product": product,
+                "readable": os.access(node, os.R_OK),
+                "writable": os.access(node, os.W_OK),
+            }
+    return None
+
+
+def resolve_job_id(client: Client, job_ref: str) -> str:
+    if job_ref != "latest":
+        return job_ref
+    scans = client.request_json("GET", "/api/scans")
+    if not scans:
+        raise SystemExit("Error: no scans found.")
+    return scans[0]["id"]
+
+
+def parse_pages_spec(spec: str | None, available_pages: list[int]) -> list[int]:
+    if not spec:
+        return list(available_pages)
+    avail_set = set(available_pages)
+    chosen: list[int] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            start, end = int(a), int(b)
+            step = 1 if end >= start else -1
+            for n in range(start, end + step, step):
+                if n not in avail_set:
+                    raise SystemExit(f"Error: page {n} not in scan (available: {available_pages})")
+                chosen.append(n)
+        else:
+            n = int(part)
+            if n not in avail_set:
+                raise SystemExit(f"Error: page {n} not in scan (available: {available_pages})")
+            chosen.append(n)
+    if not chosen:
+        raise SystemExit("Error: no pages selected.")
+    return chosen
+
+
+def export_scan(
+    client: Client,
+    job_id: str,
+    out_path: Path,
+    fmt: str | None = None,
+    image_format: str = "jpeg",
+    quality: int = 90,
+    pages_spec: str | None = None,
+    title: str | None = None,
+) -> list[Path]:
+    detail = client.request_json("GET", f"/api/scans/{job_id}")
+    avail = [p["index"] for p in detail.get("pages", [])]
+    if not avail:
+        raise SystemExit(f"Error: scan {job_id} has no pages to export.")
+    pages = parse_pages_spec(pages_spec, avail)
+    export_title = title or detail.get("name") or job_id
+
+    # Infer format from output filename if omitted
+    suffix = out_path.suffix.lower()
+    if fmt is None:
+        if suffix == ".pdf":
+            fmt = "pdf"
+        elif suffix == ".png":
+            fmt = "png"
+        elif suffix in (".jpg", ".jpeg"):
+            fmt = "jpg"
+        elif suffix == ".zip":
+            fmt = "png"
+        else:
+            fmt = "pdf"
+    fmt = fmt.lower()
+    if fmt == "jpeg":
+        fmt = "jpg"
+
+    refs = [{"jobId": job_id, "page": p} for p in pages]
+    written: list[Path] = []
+
+    if fmt == "pdf":
+        if out_path.is_dir() or str(out_path).endswith("/"):
+            out_path.mkdir(parents=True, exist_ok=True)
+            safe = "".join(c if c.isalnum() or c in " -_." else "-" for c in export_title).strip() or job_id
+            target = out_path / f"{safe}.pdf"
+        else:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            target = out_path
+        _, data, _ = client.request_raw(
+            "POST",
+            "/api/export/combine",
+            body={"pages": refs, "title": export_title, "imageFormat": image_format},
+            timeout=300.0,
+        )
+        target.write_bytes(data)
+        written.append(target)
+        return written
+
+    # Image export (png or jpg)
+    if suffix == ".zip":
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _, data, _ = client.request_raw(
+            "POST",
+            "/api/export/images",
+            body={
+                "pages": refs,
+                "title": export_title,
+                "format": "jpeg" if fmt == "jpg" else "png",
+                "quality": quality,
+            },
+            timeout=300.0,
+        )
+        out_path.write_bytes(data)
+        written.append(out_path)
+        return written
+
+    if len(pages) == 1 and not out_path.is_dir() and not str(out_path).endswith("/"):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        q = f"&quality={quality}" if fmt == "jpg" else ""
+        _, data, _ = client.request_raw(
+            "GET",
+            f"/api/scans/{job_id}/pages/{pages[0]}/export?format={fmt}{q}",
+            timeout=120.0,
+        )
+        out_path.write_bytes(data)
+        written.append(out_path)
+        return written
+
+    # Multiple pages -> write individual images into directory
+    if suffix in (".png", ".jpg", ".jpeg"):
+        out_dir = out_path.parent
+        stem = out_path.stem
+    else:
+        out_dir = out_path
+        stem = "".join(c if c.isalnum() or c in "-_." else "-" for c in export_title).strip("-") or job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ext = "jpg" if fmt == "jpg" else "png"
+    q = f"&quality={quality}" if fmt == "jpg" else ""
+    for i, page in enumerate(pages, start=1):
+        _, data, _ = client.request_raw(
+            "GET",
+            f"/api/scans/{job_id}/pages/{page}/export?format={fmt}{q}",
+            timeout=120.0,
+        )
+        target = out_dir / f"{stem}-{i:03d}.{ext}"
+        target.write_bytes(data)
+        written.append(target)
+    return written
+
+
+def run_ocr(client: Client, job_id: str, pages_spec: str | None = None) -> list[tuple[int, str]]:
+    detail = client.request_json("GET", f"/api/scans/{job_id}")
+    avail = [p["index"] for p in detail.get("pages", [])]
+    if not avail:
+        raise SystemExit(f"Error: scan {job_id} has no pages.")
+    pages = parse_pages_spec(pages_spec, avail)
+    results: list[tuple[int, str]] = []
+    warned_fallback = False
+
+    for page in pages:
+        try:
+            resp = client.request_json("GET", f"/api/scans/{job_id}/pages/{page}/ocr", timeout=180.0)
+            results.append((page, resp.get("text", "")))
+        except ApiError as e:
+            if e.code == "ocr_unavailable" and shutil.which("tesseract"):
+                if not warned_fallback:
+                    print(
+                        "Note: 'unpaper' is not installed yet; falling back to direct tesseract "
+                        "(run 'doxie-setup-system' or 'sudo pacman -S unpaper' to enable deskew before OCR).",
+                        file=sys.stderr,
+                    )
+                    warned_fallback = True
+                _, png_bytes, _ = client.request_raw("GET", f"/api/scans/{job_id}/pages/{page}")
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                    tf.write(png_bytes)
+                    tmp_path = tf.name
+                try:
+                    lang = load_env_file().get("DOXIE_OCR_LANG", "eng")
+                    proc = subprocess.run(
+                        ["tesseract", tmp_path, "stdout", "-l", lang],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    results.append((page, proc.stdout.strip()))
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            else:
+                raise
+    return results
+
+
+def cmd_status(client: Client, args: argparse.Namespace) -> int:
+    usb = find_usb_device()
+    svc = subprocess.run(
+        ["systemctl", "--user", "is-active", SERVICE_NAME],
+        capture_output=True,
+        text=True,
+    )
+    svc_state = svc.stdout.strip() or svc.stderr.strip()
+    auto_svc = subprocess.run(
+        ["systemctl", "--user", "is-active", AUTO_EXPORT_SERVICE],
+        capture_output=True,
+        text=True,
+    )
+    auto_svc_state = auto_svc.stdout.strip() or auto_svc.stderr.strip()
+    filer_svc = subprocess.run(
+        ["systemctl", "--user", "is-active", FILER_SERVICE],
+        capture_output=True,
+        text=True,
+    )
+    filer_svc_state = filer_svc.stdout.strip() or filer_svc.stderr.strip()
+
+    ver = None
+    status = None
+    daemon_err = None
+    try:
+        ver = client.request_json("GET", "/api/version", timeout=5.0)
+        status = client.request_json("GET", "/api/scanner/status", timeout=5.0)
+    except SystemExit as e:
+        daemon_err = str(e)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "url": client.base_url,
+                    "service": svc_state,
+                    "version": ver.get("version") if ver else None,
+                    "usb": usb,
+                    "scanner": status,
+                    "unpaperInstalled": shutil.which("unpaper") is not None,
+                    "tesseractInstalled": shutil.which("tesseract") is not None,
+                    "error": daemon_err,
+                },
+                indent=2,
+            )
+        )
+        return 0 if (status and status.get("connected")) else 1
+
+    print(f"Daemon URL:   {client.base_url}")
+    print(f"Service:      {svc_state} ({SERVICE_NAME})")
+    print(f"Auto-PDF:     {auto_svc_state} ({AUTO_EXPORT_SERVICE} -> {load_env_file().get('DOXIE_PDF_DIR', str(Path.home() / 'Scans'))})")
+    filer_addr = load_env_file().get("DOXIE_FILER_LISTEN_ADDR", "127.0.0.1:8401")
+    print(f"Filer GUI:    {filer_svc_state} ({FILER_SERVICE} -> http://{filer_addr})")
+    if ver:
+        print(f"Version:      {ver.get('version')}")
+    if usb:
+        perms = "rw (OK)" if (usb["readable"] and usb["writable"]) else "NO ACCESS (needs udev rule)"
+        print(f"USB Device:   {usb['product']} ({DOXIE_VID}:{DOXIE_PID}) at {usb['node']} — {perms}")
+    else:
+        print(f"USB Device:   not detected ({DOXIE_VID}:{DOXIE_PID}) — check power & USB cable")
+
+    if daemon_err:
+        print(f"Daemon Error: {daemon_err}")
+    elif status:
+        conn = "CONNECTED" if status.get("connected") else "NOT CONNECTED"
+        print(f"Scanner:      {conn} (driver={status.get('driver')})")
+        print(f"Auto-crop:    {'enabled' if status.get('autoCrop') else 'unavailable'}")
+        print(f"Auto-rotate:  {'enabled' if status.get('autoRotate') else 'unavailable'}")
+        ocr_state = "ready (unpaper + tesseract)" if (shutil.which("unpaper") and shutil.which("tesseract")) else (
+            "CLI fallback only (install 'unpaper' for GUI OCR + deskew)"
+            if shutil.which("tesseract")
+            else "unavailable"
+        )
+        print(f"OCR:          {ocr_state}")
+        if status.get("scanningJobId"):
+            print(f"Active Scan:  {status['scanningJobId']}")
+        if status.get("error"):
+            err = status["error"]
+            print(f"Scanner Err:  [{err.get('code')}] {err.get('message')}")
+
+    if usb and not (usb["readable"] and usb["writable"]):
+        print("\nAction needed: run 'doxie-setup-system' once to install the USB udev rule and unpaper.")
+    elif not shutil.which("unpaper"):
+        print("\nTip: install 'unpaper' (sudo pacman -S unpaper) to enable OCR in the web GUI.")
+
+    return 0 if (status and status.get("connected")) else 1
+
+
+def cmd_scan(client: Client, args: argparse.Namespace) -> int:
+    duplex = not args.simplex
+    auto_crop = not args.no_crop
+    auto_rotate = not args.no_rotate
+
+    resp = client.request_json(
+        "POST",
+        "/api/scans",
+        body={"duplex": duplex, "autoCrop": auto_crop, "autoRotate": auto_rotate},
+    )
+    job_id = resp["jobId"]
+    if not args.json:
+        mode = "duplex" if duplex else "simplex"
+        print(f"Started scan {job_id} ({mode}, auto-crop={auto_crop}, auto-rotate={auto_rotate})", file=sys.stderr)
+
+    last_line = ""
+    while True:
+        detail = client.request_json("GET", f"/api/scans/{job_id}")
+        state = detail.get("status")
+        if state == "running":
+            stage = detail.get("stage") or "scanning"
+            done = detail.get("stageDone") or 0
+            total = detail.get("stageTotal") or 0
+            pages_scanned = detail.get("pagesScanned")
+            parts = [stage]
+            if total:
+                parts.append(f"{done}/{total}")
+            elif done:
+                parts.append(str(done))
+            if pages_scanned is not None:
+                parts.append(f"({pages_scanned} page{'s' if pages_scanned != 1 else ''})")
+            line = "  " + " ".join(parts)
+            if not args.json and line != last_line:
+                print(line, file=sys.stderr)
+                last_line = line
+            time.sleep(0.35)
+            continue
+        break
+
+    if detail.get("status") != "completed":
+        err_msg = detail.get("error") or "scan failed"
+        if args.json:
+            print(json.dumps(detail, indent=2))
+        else:
+            print(f"Scan failed: {err_msg}", file=sys.stderr)
+        return 1
+
+    if args.name:
+        detail = client.request_json("PATCH", f"/api/scans/{job_id}", body={"name": args.name})
+
+    exported: list[Path] = []
+    if args.out:
+        exported = export_scan(
+            client,
+            job_id,
+            Path(args.out),
+            fmt=args.format,
+            image_format=args.image_format,
+            quality=args.quality,
+            title=args.name or detail.get("name"),
+        )
+
+    ocr_results = None
+    if args.ocr:
+        ocr_results = run_ocr(client, job_id)
+
+    if args.delete_after:
+        if not args.out and not args.ocr:
+            print("Warning: ignoring --delete-after because neither --out nor --ocr was given.", file=sys.stderr)
+        else:
+            client.request_raw("DELETE", f"/api/scans/{job_id}")
+
+    if args.json:
+        payload: dict[str, Any] = {
+            "scan": detail,
+            "exported": [str(p) for p in exported],
+        }
+        if ocr_results is not None:
+            payload["ocr"] = [{"page": p, "text": t} for p, t in ocr_results]
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"Completed: {job_id} — {detail.get('name')} ({detail.get('pageCount', 0)} pages)")
+        for p in exported:
+            print(f"Exported:  {p}")
+        if ocr_results is not None:
+            for page_num, text in ocr_results:
+                if len(ocr_results) > 1:
+                    print(f"\n--- Page {page_num} ---")
+                print(text)
+    return 0
+
+
+def cmd_list(client: Client, args: argparse.Namespace) -> int:
+    scans = client.request_json("GET", "/api/scans")
+    if args.limit:
+        scans = scans[: args.limit]
+    if args.json:
+        print(json.dumps(scans, indent=2))
+        return 0
+    if not scans:
+        print("No scans yet.")
+        return 0
+    print(f"{'ID':<22} {'STATUS':<10} {'PAGES':>5}  {'MODE':<7}  NAME")
+    for s in scans:
+        mode = "duplex" if s.get("duplex") else "simplex"
+        print(f"{s['id']:<22} {s['status']:<10} {s['pageCount']:>5}  {mode:<7}  {s['name']}")
+    return 0
+
+
+def cmd_show(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    detail = client.request_json("GET", f"/api/scans/{job_id}")
+    if args.json:
+        print(json.dumps(detail, indent=2))
+        return 0
+    print(f"ID:      {detail['id']}")
+    print(f"Name:    {detail['name']}")
+    print(f"Status:  {detail['status']}")
+    print(f"Created: {detail['createdAt']}")
+    print(f"Mode:    {'duplex' if detail.get('duplex') else 'simplex'} ({detail.get('dpi', 300)} DPI)")
+    print(f"Pages:   {detail.get('pageCount', 0)}")
+    if detail.get("error"):
+        print(f"Error:   {detail['error']}")
+    for p in detail.get("pages", []):
+        tags = []
+        if p.get("autoCrop"):
+            tags.append("auto-cropped")
+        if p.get("autoRotated"):
+            tags.append(f"auto-rotated {p['autoRotated']}°")
+        tag_str = f" [{', '.join(tags)}]" if tags else ""
+        print(f"  Page {p['index']:>2}: {p['widthPx']}x{p['heightPx']}px ({p['file']}){tag_str}")
+    return 0
+
+
+def cmd_export(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    written = export_scan(
+        client,
+        job_id,
+        Path(args.out),
+        fmt=args.format,
+        image_format=args.image_format,
+        quality=args.quality,
+        pages_spec=args.pages,
+        title=args.title,
+    )
+    for p in written:
+        print(p)
+    return 0
+
+
+def cmd_ocr(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    results = run_ocr(client, job_id, pages_spec=args.pages)
+    if args.json:
+        out_str = json.dumps([{"page": p, "text": t} for p, t in results], indent=2)
+    else:
+        chunks = []
+        for page_num, text in results:
+            if len(results) > 1:
+                chunks.append(f"--- Page {page_num} ---\n{text}")
+            else:
+                chunks.append(text)
+        out_str = "\n\n".join(chunks)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(out_str + "\n", encoding="utf-8")
+        print(f"Saved OCR text to {args.out}", file=sys.stderr)
+    else:
+        print(out_str)
+    return 0
+
+
+def cmd_rename(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    detail = client.request_json("PATCH", f"/api/scans/{job_id}", body={"name": args.name})
+    print(f"Renamed {detail['id']} -> {detail['name']}")
+    return 0
+
+
+def cmd_rotate(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    client.request_json(
+        "POST",
+        f"/api/scans/{job_id}/pages/{args.page}/rotate",
+        body={"degrees": args.degrees},
+    )
+    print(f"Rotated {job_id} page {args.page} by {args.degrees}°")
+    return 0
+
+
+def cmd_auto_crop(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    detail = client.request_json("POST", f"/api/scans/{job_id}/auto-crop", timeout=180.0)
+    cropped = sum(1 for p in detail.get("pages", []) if p.get("autoCrop"))
+    print(f"Auto-crop complete for {job_id} ({cropped}/{detail.get('pageCount', 0)} pages cropped)")
+    return 0
+
+
+def cmd_auto_rotate(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    detail = client.request_json("POST", f"/api/scans/{job_id}/auto-rotate", timeout=180.0)
+    rotated = sum(1 for p in detail.get("pages", []) if p.get("autoRotated"))
+    print(f"Auto-rotate complete for {job_id} ({rotated}/{detail.get('pageCount', 0)} pages rotated)")
+    return 0
+
+
+def cmd_restore(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    client.request_json("POST", f"/api/scans/{job_id}/pages/{args.page}/restore")
+    print(f"Restored original image for {job_id} page {args.page}")
+    return 0
+
+
+def cmd_pdf(args: argparse.Namespace) -> int:
+    cmd = [str(Path.home() / ".local" / "bin" / "doxie-auto-export"), "--job", args.id]
+    if args.out:
+        cmd.extend(["-o", args.out])
+    return subprocess.run(cmd).returncode
+
+
+def cmd_canon(args: argparse.Namespace) -> int:
+    source = "Flatbed" if args.flatbed else ("ADF" if args.simplex else "ADF Duplex")
+    mode = "Gray" if args.gray else "Color"
+    cmd = [
+        str(Path.home() / ".local" / "bin" / "doxie-auto-export"),
+        "--canon",
+        "--source", source,
+        "--mode", mode,
+        "--dpi", str(args.dpi),
+    ]
+    if args.out:
+        cmd.extend(["-o", args.out])
+    return subprocess.run(cmd).returncode
+
+
+def cmd_delete(client: Client, args: argparse.Namespace) -> int:
+    job_id = resolve_job_id(client, args.id)
+    if not args.yes:
+        detail = client.request_json("GET", f"/api/scans/{job_id}")
+        ans = input(f"Delete scan {job_id} ({detail.get('name')}, {detail.get('pageCount')} pages)? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("Cancelled.")
+            return 0
+    client.request_raw("DELETE", f"/api/scans/{job_id}")
+    print(f"Deleted {job_id}")
+    return 0
+
+
+def cmd_gui(client: Client, args: argparse.Namespace) -> int:
+    # Ensure daemon is running if targeting local systemd service
+    subprocess.run(["systemctl", "--user", "start", SERVICE_NAME], check=False)
+    url = client.base_url
+    if not args.browser and shutil.which("omarchy-launch-webapp"):
+        subprocess.Popen(["omarchy-launch-webapp", url], start_new_session=True)
+    elif shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], start_new_session=True)
+    else:
+        print(url)
+    return 0
+
+
+def load_filer_core():
+    for p in (REPO_ROOT, FILER_LIB_DIR):
+        ps = str(p)
+        if ps not in sys.path:
+            sys.path.insert(0, ps)
+    try:
+        from doxie_filer import core
+        return core
+    except ImportError:
+        import filer_core
+        return filer_core
+
+
+def cmd_filer_gui(args: argparse.Namespace) -> int:
+    subprocess.run(["systemctl", "--user", "start", FILER_SERVICE], check=False)
+    addr = load_env_file().get("DOXIE_FILER_LISTEN_ADDR", "127.0.0.1:8401")
+    url = addr if addr.startswith("http") else f"http://{addr}"
+    if not args.browser and shutil.which("omarchy-launch-webapp"):
+        subprocess.Popen(["omarchy-launch-webapp", url], start_new_session=True)
+    elif shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], start_new_session=True)
+    else:
+        print(url)
+    return 0
+
+
+def cmd_file(args: argparse.Namespace) -> int:
+    core = load_filer_core()
+    cfg = core.get_config()
+
+    if args.paths:
+        pdf_paths = [Path(p).expanduser().resolve() for p in args.paths]
+    else:
+        items = core.list_inbox_pdfs(cfg["inbox_dir"])
+        if not items:
+            print(f"No PDFs found in inbox ({cfg['inbox_dir']}).")
+            return 0
+        pdf_paths = [Path(i["path"]) for i in items]
+
+    all_folders = core.list_target_folders(cfg["target_root"], pruned=False)
+    tier = "strong" if args.strong else "fast"
+    results_json: list[dict[str, Any]] = []
+
+    for idx, pdf_path in enumerate(pdf_paths, start=1):
+        if not pdf_path.is_file():
+            print(f"Skipping missing file: {pdf_path}", file=sys.stderr)
+            continue
+
+        current_tier = tier
+        force = args.no_cache
+        while True:
+            if not args.json:
+                print(
+                    f"\n[{idx}/{len(pdf_paths)}] Analyzing {pdf_path.name} "
+                    f"({cfg['model_strong'] if current_tier == 'strong' else cfg['model_fast']})...",
+                    file=sys.stderr,
+                )
+            rec = core.recommend_for_pdf(
+                pdf_path,
+                cfg=cfg,
+                tier=current_tier,
+                model_override=args.model,
+                bypass_cache=force,
+            )
+            force = False
+
+            if args.dry_run:
+                if args.json:
+                    results_json.append(rec)
+                else:
+                    _print_rec(rec, cfg["target_root"])
+                break
+
+            chosen_folder = rec["recommended_folder"]
+            chosen_name = rec["suggested_filename"]
+
+            while True:
+                _print_rec(rec, cfg["target_root"], chosen_folder, chosen_name)
+                print(
+                    "Actions: [a/Enter] Approve & move | [1-3] Pick alt | [b] Browse folders | [f] Search folder | "
+                    "[n] New folder | [r] Rename | [k] Keep orig name | "
+                    "[m] Re-analyze (27B) | [o] Open PDF | [s] Skip | [q] Quit"
+                )
+                try:
+                    choice = input("> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return 0
+
+                low = choice.lower()
+                if low in ("", "a", "approve", "y", "yes"):
+                    user_note = None
+                    save_rule = False
+                    if chosen_folder != rec.get("recommended_folder"):
+                        hint = input("Override — optional note to teach Filer (prefix 'rule: ' to save permanent rule, Enter to skip): ").strip()
+                        if hint.lower().startswith("rule:"):
+                            save_rule = True
+                            user_note = hint[5:].strip()
+                        elif hint:
+                            user_note = hint
+                    entry = core.approve_move(
+                        pdf_path,
+                        relative_folder=chosen_folder,
+                        filename=chosen_name,
+                        cfg=cfg,
+                        recommendation=rec,
+                        copy_only=args.copy,
+                        user_note=user_note,
+                        save_rule=save_rule,
+                    )
+                    verb = "Copied" if args.copy else "Moved"
+                    extra = ""
+                    if entry.get("created_rule"):
+                        extra = f" | Saved rule: {entry['created_rule']['name']}"
+                    elif entry.get("invalidated_cache_count", 0) > 0:
+                        extra = f" | Refreshed {entry['invalidated_cache_count']} similar cached PDF(s)"
+                    print(f"✓ {verb} to: {entry['dest_path']}  (undo id: {entry['id']}){extra}")
+                    break
+                if low in ("1", "2", "3", "4"):
+                    alts = rec.get("alternatives") or []
+                    ai = int(low) - 1
+                    if 0 <= ai < len(alts):
+                        chosen_folder = alts[ai]["folder"]
+                    else:
+                        print("No alternative at that index.")
+                    continue
+                if low == "b":
+                    picked = _browse_folders_cli(core, cfg["target_root"], chosen_folder)
+                    if picked:
+                        chosen_folder = picked
+                    continue
+                if low == "f":
+                    q = input("Search folders (space-separated keywords): ").strip().lower()
+                    parts = q.split()
+                    matches = [f for f in all_folders if all(p in f.lower() for p in parts)][:20]
+                    if not matches:
+                        print("No matching folders.")
+                        continue
+                    for mi, m in enumerate(matches, start=1):
+                        print(f"  {mi:>2}. {m}")
+                    pick = input("Pick number (or Enter to cancel): ").strip()
+                    if pick.isdigit() and 1 <= int(pick) <= len(matches):
+                        chosen_folder = matches[int(pick) - 1]
+                    continue
+                if low == "n":
+                    nf = input(f"Relative folder inside {cfg['target_root'].name}: ").strip()
+                    if nf:
+                        chosen_folder = core.sanitize_relative_folder(nf)
+                    continue
+                if low == "r":
+                    rn = input(f"New filename [{chosen_name}]: ").strip()
+                    if rn:
+                        chosen_name = core.sanitize_filename(rn, pdf_path.name)
+                    continue
+                if low == "k":
+                    chosen_name = pdf_path.name
+                    continue
+                if low == "m":
+                    current_tier = "strong"
+                    force = True
+                    break
+                if low == "o":
+                    if shutil.which("xdg-open"):
+                        subprocess.Popen(["xdg-open", str(pdf_path)], start_new_session=True)
+                    else:
+                        print(f"File: {pdf_path}")
+                    continue
+                if low == "s":
+                    print("Skipped.")
+                    break
+                if low == "q":
+                    return 0
+                print("Unrecognized action.")
+
+            if low == "m":
+                continue
+            break
+
+    if args.dry_run and args.json:
+        print(json.dumps(results_json if len(results_json) != 1 else results_json[0], indent=2))
+    return 0
+
+
+def _browse_folders_cli(core: Any, target_root: Path, start_rel: str = "") -> str | None:
+    """Interactive folder picker starting in target root (uses native dialog if zenity present, else terminal drill-down)."""
+    # Try native GUI folder dialog when running in a desktop session and zenity/kdialog is installed
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+        start_dir = (target_root / start_rel) if start_rel and (target_root / start_rel).is_dir() else target_root
+        if shutil.which("zenity"):
+            proc = subprocess.run(
+                ["zenity", "--file-selection", "--directory", "--title=Choose Destination Folder", f"--filename={start_dir}/"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                chosen = Path(proc.stdout.strip()).resolve()
+                try:
+                    return chosen.relative_to(target_root.resolve()).as_posix()
+                except ValueError:
+                    print(f"Selected folder must be inside {target_root}.")
+                    return None
+            return None
+
+    cur = start_rel
+    while cur and not (target_root / cur).is_dir():
+        cur = cur.rsplit("/", 1)[0] if "/" in cur else ""
+
+    while True:
+        info = core.browse_folder(target_root, cur)
+        print(f"\nFolder: {info['rootName']}/{info['path']}" if info["path"] else f"\nFolder: {info['rootName']}/")
+        dirs = info["dirs"]
+        for i, d in enumerate(dirs, start=1):
+            suffix = "/" if d["hasChildren"] else ""
+            print(f"  {i:>2}. {d['name']}{suffix}")
+        if info["files"]:
+            print(f"  (existing files: {', '.join(info['files'][:4])}{'…' if info['totalFiles'] > 4 else ''})")
+        print("Pick number to open | [s] Select this folder | [u] Up | [n] New subfolder | [c] Cancel")
+        ans = input("browse> ").strip()
+        low = ans.lower()
+        if low in ("c", "cancel", "q"):
+            return None
+        if low in ("s", "select", ""):
+            if info["path"]:
+                return info["path"]
+            print(f"Pick a subfolder inside {info['rootName']} first.")
+            continue
+        if low in ("u", "up", ".."):
+            if info["parent"] is not None:
+                cur = info["parent"]
+            continue
+        if low == "n":
+            name = input("New subfolder name: ").strip().replace("/", "-")
+            if name:
+                return f"{cur}/{name}" if cur else name
+            continue
+        if ans.isdigit() and 1 <= int(ans) <= len(dirs):
+            cur = dirs[int(ans) - 1]["path"]
+            continue
+        print("Invalid selection.")
+
+
+def _print_rec(
+    rec: dict[str, Any],
+    target_root: Path,
+    chosen_folder: str | None = None,
+    chosen_name: str | None = None,
+) -> None:
+    folder = chosen_folder or rec["recommended_folder"]
+    fname = chosen_name or rec["suggested_filename"]
+    new_tag = " [NEW FOLDER]" if not (target_root / folder).is_dir() else ""
+    print("=" * 72)
+    print(f"File:        {rec['original_filename']} ({rec.get('page_count') or '?'} pages)")
+    print(f"Summary:     {rec.get('summary')}")
+    print(
+        f"Metadata:    person={rec.get('person')} | source={rec.get('vendor_or_source')} | "
+        f"type={rec.get('document_type')} | date={rec.get('document_date') or 'unknown'}"
+    )
+    print(f"Model:       {rec.get('model')} | confidence={rec.get('confidence')}{' (cached)' if rec.get('cached') else ''}")
+    if rec.get("matched_rule"):
+        print(f"MatchedRule: ★ {rec['matched_rule']}")
+    print(f"Why:         {rec.get('why')}")
+    if rec.get("llm_error"):
+        print(f"LLM Note:    {rec['llm_error']}")
+    print(f"\nDestination: {folder}/{fname}{new_tag}")
+    alts = rec.get("alternatives") or []
+    if alts:
+        print("Alternatives:")
+        for i, a in enumerate(alts, start=1):
+            atag = " [NEW]" if a.get("is_new_folder") else ""
+            print(f"  [{i}] {a['folder']}{atag} — {a.get('why', '')}")
+    sibs = rec.get("sibling_examples") or []
+    if sibs and folder == rec["recommended_folder"]:
+        print(f"Existing in folder: {', '.join(sibs[:3])}")
+    print("=" * 72)
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    core = load_filer_core()
+    cfg = core.get_config()
+    items = core.list_inbox_pdfs(cfg["inbox_dir"])
+    if not items:
+        print(f"No PDFs in inbox ({cfg['inbox_dir']}).")
+        return 0
+    tier = "strong" if args.strong else "fast"
+    total = len(items)
+    for idx, item in enumerate(items, start=1):
+        p = Path(item["path"])
+        if not args.force and core.get_cached_recommendation(p, cfg) is not None:
+            cached = core.get_cached_recommendation(p, cfg)
+            print(f"[{idx}/{total}] (cached) {p.name} -> {cached.get('recommended_folder')}")
+            continue
+        print(f"[{idx}/{total}] Analyzing {p.name}...", end=" ", flush=True)
+        rec = core.recommend_for_pdf(p, cfg=cfg, tier=tier, bypass_cache=args.force)
+        print(f"-> {rec.get('recommended_folder')}/{rec.get('suggested_filename')} [{rec.get('confidence')}]")
+    return 0
+
+
+def cmd_rules(args: argparse.Namespace) -> int:
+    core = load_filer_core()
+    act = args.rules_action
+    if act in (None, "list"):
+        rules = core.load_rules()
+        if args.json:
+            print(json.dumps(rules, indent=2))
+            return 0
+        if not rules:
+            print("No filing rules yet.")
+            return 0
+        for r in rules:
+            st = "ON " if r.get("enabled", True) else "OFF"
+            kws = ", ".join(r.get("keywords") or [])
+            print(f"[{st}] {r['id']}  {r['name']}")
+            print(f"      -> {r['folder']}")
+            print(f"      when: {r['when']}" + (f" | person={r['person']}" if r.get("person") else ""))
+            if kws:
+                print(f"      cues: {kws}")
+        return 0
+    if act == "suggest":
+        sugs = core.suggest_rules_from_history()
+        if args.json:
+            print(json.dumps(sugs, indent=2))
+            return 0
+        if not sugs:
+            print("No new uncovered override patterns found.")
+            return 0
+        for s in sugs:
+            print(f"• {s['name']} ({s['override_count']} overrides) -> {s['folder']}")
+            print(f"  when: {s['when']} | cues: {', '.join(s['keywords'])}")
+        return 0
+    if act == "add":
+        kws = [x.strip() for x in (args.keywords or "").split(",") if x.strip()]
+        rule = core.add_rule(
+            name=args.name,
+            folder=args.folder,
+            when=args.when or args.name,
+            keywords=kws,
+            person=args.person,
+            source="cli",
+        )
+        print(f"Added rule {rule['id']}: {rule['name']} -> {rule['folder']}")
+        return 0
+    if act == "delete":
+        ok = core.delete_rule(args.id)
+        print(f"Deleted {args.id}" if ok else f"Rule not found: {args.id}")
+        return 0 if ok else 1
+    return 0
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    core = load_filer_core()
+    entry = core.undo_move(args.id)
+    print(f"Undone {entry['id']}: restored to {entry.get('restored_path')}")
+    return 0
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    core = load_filer_core()
+    items = core.load_history(limit=args.limit, include_undone=True)
+    if args.json:
+        print(json.dumps(items, indent=2))
+        return 0
+    if not items:
+        print("No filing history yet.")
+        return 0
+    for e in items:
+        status = " [UNDONE]" if e.get("undone") else ""
+        print(f"{e['id']}  {e['relative_folder']}/{e['filename']}{status}")
+        if e.get("summary"):
+            print(f"    {e['summary']}")
+    return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    action = args.action
+    services = [SERVICE_NAME, AUTO_EXPORT_SERVICE, FILER_SERVICE]
+    if action == "logs":
+        cmd = [
+            "journalctl", "--user",
+            "-u", SERVICE_NAME,
+            "-u", AUTO_EXPORT_SERVICE,
+            "-u", FILER_SERVICE,
+            "-n", str(args.lines),
+        ]
+        if args.follow:
+            cmd.append("-f")
+        return subprocess.run(cmd).returncode
+    return subprocess.run(["systemctl", "--user", action, *services]).returncode
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="doxie",
+        description="CLI and GUI launcher for the Doxie Pro DX400 scanner.",
+    )
+    parser.add_argument(
+        "--url",
+        default=default_base_url(),
+        help="doxie-scanner server URL (default: from ~/.config/doxie-scanner/env or http://127.0.0.1:8400)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_status = sub.add_parser("status", help="Show daemon, USB, and scanner status")
+    p_status.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_scan = sub.add_parser("scan", help="Start a new scan")
+    mode = p_scan.add_mutually_exclusive_group()
+    mode.add_argument("--duplex", action="store_true", help="Scan both sides (default)")
+    mode.add_argument("--simplex", action="store_true", help="Scan one side only")
+    p_scan.add_argument("--no-crop", action="store_true", help="Disable auto-crop & straighten")
+    p_scan.add_argument("--no-rotate", action="store_true", help="Disable auto-rotate")
+    p_scan.add_argument("--name", help="Rename the scan after completion")
+    p_scan.add_argument("-o", "--out", help="Export scan immediately to this file or directory")
+    p_scan.add_argument("--format", choices=["pdf", "png", "jpg", "jpeg"], help="Export format (inferred from --out if omitted)")
+    p_scan.add_argument("--image-format", choices=["jpeg", "png"], default="jpeg", help="PDF embedded image format (default: jpeg)")
+    p_scan.add_argument("--quality", type=int, default=90, help="JPEG quality 1-100 (default: 90)")
+    p_scan.add_argument("--ocr", action="store_true", help="Run OCR on scanned pages and print text")
+    p_scan.add_argument("--delete-after", action="store_true", help="Delete scan from server after export/OCR")
+    p_scan.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_list = sub.add_parser("list", aliases=["ls"], help="List scans")
+    p_list.add_argument("-n", "--limit", type=int, help="Maximum number of scans to show")
+    p_list.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_show = sub.add_parser("show", help="Show scan details and pages")
+    p_show.add_argument("id", nargs="?", default="latest", help="Scan ID or 'latest' (default: latest)")
+    p_show.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_export = sub.add_parser("export", help="Export a scan to PDF, PNG, JPEG, or ZIP")
+    p_export.add_argument("id", nargs="?", default="latest", help="Scan ID or 'latest' (default: latest)")
+    p_export.add_argument("-o", "--out", required=True, help="Output file (.pdf/.png/.jpg/.zip) or directory")
+    p_export.add_argument("--format", choices=["pdf", "png", "jpg", "jpeg"], help="Format (inferred from --out if omitted)")
+    p_export.add_argument("--image-format", choices=["jpeg", "png"], default="jpeg", help="PDF embedded image format (default: jpeg)")
+    p_export.add_argument("--quality", type=int, default=90, help="JPEG quality 1-100 (default: 90)")
+    p_export.add_argument("--pages", help="Page selection, e.g. '1,3-5'")
+    p_export.add_argument("--title", help="Document title")
+
+    p_ocr = sub.add_parser("ocr", help="Extract text from a scan via OCR")
+    p_ocr.add_argument("id", nargs="?", default="latest", help="Scan ID or 'latest' (default: latest)")
+    p_ocr.add_argument("--pages", help="Page selection, e.g. '1,2'")
+    p_ocr.add_argument("-o", "--out", help="Write extracted text to file")
+    p_ocr.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_rename = sub.add_parser("rename", help="Rename a scan")
+    p_rename.add_argument("id", help="Scan ID or 'latest'")
+    p_rename.add_argument("name", help="New scan name")
+
+    p_rot = sub.add_parser("rotate", help="Rotate a single page clockwise")
+    p_rot.add_argument("id", help="Scan ID or 'latest'")
+    p_rot.add_argument("page", type=int, help="1-based page number")
+    p_rot.add_argument("degrees", type=int, choices=[90, 180, 270], help="Clockwise rotation")
+
+    p_ac = sub.add_parser("auto-crop", help="Run auto-crop & straighten on an existing scan")
+    p_ac.add_argument("id", nargs="?", default="latest", help="Scan ID or 'latest'")
+
+    p_ar = sub.add_parser("auto-rotate", help="Run auto-rotate on an existing scan")
+    p_ar.add_argument("id", nargs="?", default="latest", help="Scan ID or 'latest'")
+
+    p_res = sub.add_parser("restore", help="Restore a page's original image before auto-crop")
+    p_res.add_argument("id", help="Scan ID or 'latest'")
+    p_res.add_argument("page", type=int, help="1-based page number")
+
+    p_pdf = sub.add_parser("pdf", help="Build a searchable PDF (OCR + auto-detected source name)")
+    p_pdf.add_argument("id", nargs="?", default="latest", help="Scan ID or 'latest' (default: latest)")
+    p_pdf.add_argument("-o", "--out", help="Output file or directory (default: configured DOXIE_PDF_DIR)")
+
+    p_canon = sub.add_parser("canon", help="Pull a scan from a network eSCL/SANE scanner into the inbox")
+    c_src = p_canon.add_mutually_exclusive_group()
+    c_src.add_argument("--duplex", action="store_true", help="ADF Duplex (default)")
+    c_src.add_argument("--simplex", action="store_true", help="ADF single-sided")
+    c_src.add_argument("--flatbed", action="store_true", help="Flatbed glass")
+    p_canon.add_argument("--gray", action="store_true", help="Scan in grayscale (default: color)")
+    p_canon.add_argument("--dpi", type=int, default=300, choices=[150, 300], help="Scan DPI (default: 300)")
+    p_canon.add_argument("-o", "--out", help="Output file or directory (default: configured DOXIE_PDF_DIR)")
+
+    p_del = sub.add_parser("delete", aliases=["rm"], help="Delete a scan")
+    p_del.add_argument("id", help="Scan ID or 'latest'")
+    p_del.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+
+    p_gui = sub.add_parser("gui", aliases=["open"], help="Open the Doxie Scanner GUI")
+    p_gui.add_argument("--browser", action="store_true", help="Open in default browser tab instead of webapp window")
+
+    p_filer = sub.add_parser("filer", help="Open the Doxie Filer Web Inbox GUI")
+    p_filer.add_argument("--browser", action="store_true", help="Open in default browser tab instead of webapp window")
+
+    p_file = sub.add_parser("file", help="Review AI folder recommendations and approve/move PDFs into target root")
+    p_file.add_argument("paths", nargs="*", help="Specific PDF file(s) to file (default: all PDFs in DOXIE_INBOX_DIR)")
+    p_file.add_argument("--strong", action="store_true", help="Use strong local model (DOXIE_FILER_MODEL_STRONG)")
+    p_file.add_argument("--model", help="Override LM Studio model key explicitly")
+    p_file.add_argument("--no-cache", action="store_true", help="Re-run recommendation ignoring cached result")
+    p_file.add_argument("--copy", action="store_true", help="Copy instead of moving out of inbox")
+    p_file.add_argument("--dry-run", action="store_true", help="Show recommendations without prompting or moving")
+    p_file.add_argument("--json", action="store_true", help="Output JSON (with --dry-run)")
+
+    p_ana = sub.add_parser("analyze", help="Pre-analyze and cache recommendations for all PDFs in inbox")
+    p_ana.add_argument("--strong", action="store_true", help="Use strong model (DOXIE_FILER_MODEL_STRONG)")
+    p_ana.add_argument("--force", action="store_true", help="Re-analyze even if already cached")
+
+    p_rules = sub.add_parser("rules", help="View, add, suggest, or delete learned filing rules")
+    p_rules.add_argument("--json", action="store_true", help="Output JSON")
+    r_sub = p_rules.add_subparsers(dest="rules_action")
+    r_sub.add_parser("list", help="List rules")
+    r_sub.add_parser("suggest", help="Suggest new rules from past overrides")
+    r_add = r_sub.add_parser("add", help="Add a filing rule")
+    r_add.add_argument("--name", required=True, help="Short rule name")
+    r_add.add_argument("--folder", required=True, help="Target folder inside DOXIE_TARGET_ROOT (supports {YEAR})")
+    r_add.add_argument("--when", help="Description of when to apply")
+    r_add.add_argument("--keywords", help="Comma-separated cue keywords")
+    r_add.add_argument("--person", help="Optional person/household member name")
+    r_del = r_sub.add_parser("delete", help="Delete a rule by ID")
+    r_del.add_argument("id", help="Rule ID")
+
+    p_undo = sub.add_parser("undo", help="Undo the most recent (or specified) PDF move")
+    p_undo.add_argument("id", nargs="?", help="Optional history entry ID to undo (default: latest)")
+
+    p_hist = sub.add_parser("history", help="Show filing history & move audit log")
+    p_hist.add_argument("-n", "--limit", type=int, default=20, help="Number of entries to show (default: 20)")
+    p_hist.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_svc = sub.add_parser("service", help="Manage the background systemd user service")
+    p_svc.add_argument("action", nargs="?", default="status", choices=["status", "start", "stop", "restart", "logs"])
+    p_svc.add_argument("-f", "--follow", action="store_true", help="Follow logs (with 'logs')")
+    p_svc.add_argument("-n", "--lines", type=int, default=50, help="Number of log lines (default: 50)")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "service":
+        return cmd_service(args)
+    if args.command == "filer":
+        return cmd_filer_gui(args)
+    if args.command == "file":
+        return cmd_file(args)
+    if args.command == "analyze":
+        return cmd_analyze(args)
+    if args.command == "rules":
+        return cmd_rules(args)
+    if args.command == "undo":
+        return cmd_undo(args)
+    if args.command == "history":
+        return cmd_history(args)
+    if args.command == "canon":
+        return cmd_canon(args)
+
+    client = Client(args.url)
+    try:
+        if args.command == "status":
+            return cmd_status(client, args)
+        if args.command == "scan":
+            return cmd_scan(client, args)
+        if args.command in ("list", "ls"):
+            return cmd_list(client, args)
+        if args.command == "show":
+            return cmd_show(client, args)
+        if args.command == "export":
+            return cmd_export(client, args)
+        if args.command == "ocr":
+            return cmd_ocr(client, args)
+        if args.command == "rename":
+            return cmd_rename(client, args)
+        if args.command == "rotate":
+            return cmd_rotate(client, args)
+        if args.command == "auto-crop":
+            return cmd_auto_crop(client, args)
+        if args.command == "auto-rotate":
+            return cmd_auto_rotate(client, args)
+        if args.command == "restore":
+            return cmd_restore(client, args)
+        if args.command == "pdf":
+            return cmd_pdf(args)
+        if args.command in ("delete", "rm"):
+            return cmd_delete(client, args)
+        if args.command in ("gui", "open"):
+            return cmd_gui(client, args)
+    except ApiError as e:
+        print(f"Error [{e.code}]: {e.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

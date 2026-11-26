@@ -1,0 +1,13 @@
+[Unit]
+Description=Doxie Filer Web Inbox (Local AI PDF Recommender & Approver)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/doxie-scanner/env
+ExecStart=%h/.local/bin/doxie-filer-web
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

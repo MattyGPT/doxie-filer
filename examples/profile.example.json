@@ -1,0 +1,30 @@
+{
+  "household_description": "a family document archive (Alice, Bob, and kids)",
+  "people": {
+    "Alice": ["alice"],
+    "Bob": ["bob", "robert"]
+  },
+  "fallback_folder": "Shared/Unsorted",
+  "extra_stopwords": [],
+  "top_level_notes": [
+    "'Shared/...' holds shared household records (Health, Financial, Auto, Home, Kids).",
+    "'Taxes/<YYYY> Taxes' holds W-2s, 1099s, and tax returns organized by year."
+  ],
+  "prune_subtrees": [
+    "Scans",
+    "Camera Uploads",
+    "Shared/Photos"
+  ],
+  "conditional_deep": {
+    "Shared/Travel": ["flight", "hotel", "itinerary", "airline", "vacation"]
+  },
+  "deep_include_roots": {
+    "Shared": {
+      "max_depth": 4,
+      "depth4_parents": ["Health", "Financial", "Auto", "Home"]
+    },
+    "Taxes": {"max_depth": 2}
+  },
+  "year_pruned_roots": ["Taxes"],
+  "hide_in_browser": ["Scans"]
+}

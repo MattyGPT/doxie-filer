@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+.env
+env
+profile.json
+filing-rules.json
+filing-history.jsonl
+rec-cache.json
+exported.json
+*.pdf
+*.png
+*.jpg
+*.jpeg
+.DS_Store

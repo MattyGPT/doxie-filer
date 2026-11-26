@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Doxie Scanner
+GenericName=Document Scanner
+Comment=Scan, auto-crop, OCR, and export documents from your Doxie Pro
+Exec=doxie gui
+Icon=scanner
+Terminal=false
+Type=Application
+Categories=Office;Scanning;Graphics;Utility;
+Keywords=Doxie;Scanner;Scan;PDF;OCR;Document;
+StartupNotify=true
+StartupWMClass=chrome-127.0.0.1__-Default

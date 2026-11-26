@@ -1,0 +1,1344 @@
+#!/usr/bin/env python3
+"""Local Web Inbox GUI for reviewing, approving, and filing scanned PDFs."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+import urllib.parse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+for _p in (Path(__file__).resolve().parent.parent, Path.home() / ".local" / "share" / "doxie-filer"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+try:
+    from doxie_filer import core
+except ImportError:
+    import filer_core as core
+
+
+class BatchAnalyzer:
+    """Runs background sequential LLM analysis for all uncached inbox PDFs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running = False
+        self._cancel = False
+        self._tier = "fast"
+        self._total = 0
+        self._done = 0
+        self._failed = 0
+        self._current: str | None = None
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "running": self._running,
+                "tier": self._tier,
+                "total": self._total,
+                "done": self._done,
+                "failed": self._failed,
+                "current": self._current,
+            }
+
+    def stop(self) -> dict:
+        with self._lock:
+            if self._running:
+                self._cancel = True
+            return {
+                "running": self._running,
+                "tier": self._tier,
+                "total": self._total,
+                "done": self._done,
+                "failed": self._failed,
+                "current": self._current,
+                "cancelling": self._cancel,
+            }
+
+    def start(self, cfg: dict, tier: str = "fast", force: bool = False) -> dict:
+        with self._lock:
+            if self._running:
+                return {
+                    "running": True,
+                    "tier": self._tier,
+                    "total": self._total,
+                    "done": self._done,
+                    "failed": self._failed,
+                    "current": self._current,
+                }
+            items = core.list_inbox_pdfs(cfg["inbox_dir"])
+            targets: list[Path] = []
+            for item in items:
+                p = Path(item["path"])
+                if not force and core.get_cached_recommendation(p, cfg) is not None:
+                    continue
+                targets.append(p)
+            if not targets:
+                return {
+                    "running": False,
+                    "tier": tier,
+                    "total": 0,
+                    "done": 0,
+                    "failed": 0,
+                    "current": None,
+                }
+            self._running = True
+            self._cancel = False
+            self._tier = tier
+            self._total = len(targets)
+            self._done = 0
+            self._failed = 0
+            self._current = targets[0].name
+
+        t = threading.Thread(target=self._worker, args=(cfg, targets, tier, force), daemon=True)
+        t.start()
+        return self.status()
+
+    def _worker(self, cfg: dict, targets: list[Path], tier: str, force: bool) -> None:
+        try:
+            for pdf in targets:
+                with self._lock:
+                    if self._cancel:
+                        break
+                    self._current = pdf.name
+                if not pdf.is_file():
+                    with self._lock:
+                        self._done += 1
+                    continue
+                try:
+                    rec = core.recommend_for_pdf(pdf, cfg=cfg, tier=tier, bypass_cache=force)
+                    with self._lock:
+                        self._done += 1
+                        if rec.get("fallback"):
+                            self._failed += 1
+                except Exception as exc:
+                    sys.stderr.write(f"[doxie-filer] batch error on {pdf.name}: {exc}\n")
+                    with self._lock:
+                        self._done += 1
+                        self._failed += 1
+        finally:
+            with self._lock:
+                self._running = False
+                self._cancel = False
+                self._current = None
+
+
+BATCH = BatchAnalyzer()
+
+HTML_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Doxie Filer — Document Inbox</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #171a23;
+      --panel-2: #1f2430;
+      --border: #2a3142;
+      --text: #e6ebf5;
+      --muted: #93a0b8;
+      --accent: #5b9cf6;
+      --green: #34c77b;
+      --amber: #f0b429;
+      --red: #f05a65;
+      --new: #a78bfa;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; font-size: 14px; }
+    body { display: flex; flex-direction: column; overflow: hidden; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+      gap: 12px; flex-shrink: 0;
+    }
+    header h1 { margin: 0; font-size: 16px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+    .pill.high { color: var(--green); border-color: rgba(52,199,123,.4); }
+    .pill.medium { color: var(--amber); border-color: rgba(240,180,41,.4); }
+    .pill.low { color: var(--red); border-color: rgba(240,90,101,.4); }
+    .pill.new { color: var(--new); border-color: rgba(167,139,250,.45); }
+    .header-actions { display: flex; align-items: center; gap: 8px; }
+    button, .btn {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 11px; cursor: pointer; font-size: 13px; text-decoration: none;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    button:hover, .btn:hover { border-color: var(--accent); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.primary { background: var(--green); color: #071b10; border-color: var(--green); font-weight: 650; }
+    button.primary:hover { filter: brightness(1.06); }
+    button.accent { background: rgba(91,156,246,.15); border-color: var(--accent); color: #b7d4ff; }
+    button.danger { color: #ff9aa1; border-color: rgba(240,90,101,.4); }
+    button.danger:hover { background: rgba(240,90,101,.15); border-color: var(--red); }
+
+    main { display: grid; grid-template-columns: 270px 1fr 410px; flex: 1; min-height: 0; }
+    .col { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+    .col:last-child { border-right: none; }
+    .col-header {
+      padding: 10px 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+      color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .scroll { flex: 1; overflow-y: auto; padding: 10px; }
+
+    .inbox-item {
+      padding: 10px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; margin-bottom: 6px;
+      background: var(--panel);
+    }
+    .inbox-item:hover { border-color: var(--border); }
+    .inbox-item.active { border-color: var(--accent); background: rgba(91,156,246,.12); }
+    .inbox-name { font-weight: 600; word-break: break-word; line-height: 1.3; }
+    .inbox-meta { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; justify-content: space-between; gap: 6px; }
+    .inbox-status { font-size: 11px; margin-top: 5px; display: flex; align-items: center; gap: 6px; color: var(--muted); overflow: hidden; }
+    .inbox-status .ready { color: var(--green); font-weight: 600; flex-shrink: 0; }
+    .inbox-status .folder-hint { font-family: ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #9fb2d4; }
+    .inbox-status .analyzing { color: var(--accent); display: inline-flex; align-items: center; gap: 5px; }
+
+    .preview-wrap { flex: 1; background: #1e212b; display: flex; align-items: center; justify-content: center; min-height: 0; }
+    iframe.pdf-frame { width: 100%; height: 100%; border: none; background: #fff; }
+    .empty { color: var(--muted); text-align: center; padding: 32px 16px; line-height: 1.6; }
+
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; display: flex; align-items: center; justify-content: space-between; }
+    .summary { font-size: 14px; line-height: 1.45; margin-bottom: 8px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .why-box { font-size: 13px; line-height: 1.5; color: #d5def0; background: var(--panel-2); padding: 10px; border-radius: 6px; border-left: 3px solid var(--accent); }
+
+    .folder-opt {
+      padding: 9px 10px; border: 1px solid var(--border); border-radius: 7px; margin-bottom: 6px;
+      cursor: pointer; background: var(--panel-2);
+    }
+    .folder-opt:hover { border-color: var(--accent); }
+    .folder-opt.selected { border-color: var(--green); background: rgba(52,199,123,.12); }
+    .folder-path { font-family: ui-monospace, monospace; font-size: 12.5px; font-weight: 600; word-break: break-word; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .folder-why { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+
+    label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px 0; }
+    input[type="text"] {
+      width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); font-size: 13px; font-family: inherit;
+    }
+    input[type="text"]:focus { outline: none; border-color: var(--accent); }
+    .mono { font-family: ui-monospace, monospace !important; font-size: 12.5px !important; }
+    .search-results {
+      max-height: 150px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px;
+      margin-top: 4px; background: var(--bg); display: none;
+    }
+    .search-results.open { display: block; }
+    .search-item { padding: 6px 9px; font-family: ui-monospace, monospace; font-size: 12px; cursor: pointer; border-bottom: 1px solid rgba(42,49,66,.5); }
+    .search-item:hover { background: rgba(91,156,246,.15); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .row-between { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .siblings { font-size: 11.5px; color: var(--muted); margin-top: 6px; font-family: ui-monospace, monospace; line-height: 1.45; }
+
+    .toast {
+      position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+      background: #1d2433; border: 1px solid var(--accent); color: var(--text);
+      padding: 10px 16px; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.45);
+      z-index: 50; display: none; align-items: center; gap: 12px;
+    }
+    .toast.show { display: flex; }
+
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+      align-items: center; justify-content: center; z-index: 60;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      width: min(720px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+    }
+    .history-item { padding: 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+    .picker-modal {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      width: min(760px, 94vw); height: min(620px, 86vh); display: flex; flex-direction: column; overflow: hidden;
+    }
+    .picker-crumbs {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 8px 12px;
+      background: var(--panel-2); border-bottom: 1px solid var(--border); font-family: ui-monospace, monospace; font-size: 12.5px;
+    }
+    .crumb { cursor: pointer; color: var(--accent); padding: 2px 5px; border-radius: 4px; }
+    .crumb:hover { background: rgba(91,156,246,.16); }
+    .crumb.current { color: var(--text); font-weight: 650; cursor: default; }
+    .picker-toolbar { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; }
+    .picker-body { display: grid; grid-template-columns: 1.35fr 1fr; flex: 1; min-height: 0; }
+    .picker-dirs { overflow-y: auto; border-right: 1px solid var(--border); padding: 6px; }
+    .picker-files { overflow-y: auto; padding: 10px 12px; background: rgba(15,17,23,.45); }
+    .picker-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 8px 10px; border-radius: 6px; cursor: pointer; border: 1px solid transparent;
+    }
+    .picker-row:hover { background: rgba(91,156,246,.14); border-color: rgba(91,156,246,.35); }
+    .picker-row-name { display: flex; align-items: center; gap: 8px; font-size: 13px; word-break: break-word; }
+    .picker-row-arrow { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+    .picker-footer {
+      padding: 10px 12px; background: var(--panel-2); border-top: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    }
+    .picker-selected { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); word-break: break-all; flex: 1; }
+    .teach-box {
+      margin-top: 10px; padding: 10px; border-radius: 7px;
+      border: 1px solid rgba(167,139,250,.4); background: rgba(167,139,250,.08);
+      display: none;
+    }
+    .teach-box.open { display: block; }
+    .teach-box label { margin-top: 6px; }
+    .rule-item { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .rule-item.disabled { opacity: .55; }
+    .rule-form { padding: 12px; border-top: 1px solid var(--border); background: var(--panel-2); }
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>
+      <span>Doxie Filer</span>
+      <span class="pill" id="inboxCount">0 in inbox</span>
+      <span class="pill" id="targetLabel">Documents</span>
+    </h1>
+    <div class="header-actions">
+      <button id="btnAnalyzeAll" class="accent">⚡ Analyze All</button>
+      <a class="btn" href="http://127.0.0.1:8400" target="_blank">Open Doxie Scanner ↗</a>
+      <button id="btnRefresh">Refresh Inbox</button>
+      <button id="btnRules">Rules</button>
+      <button id="btnHistory">History / Undo</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="col">
+      <div class="col-header">
+        <span>Scans Inbox</span>
+        <span id="inboxPath" style="font-weight:400; text-transform:none;"></span>
+      </div>
+      <div class="scroll" id="inboxList"></div>
+    </section>
+
+    <section class="col">
+      <div class="col-header">
+        <span id="previewTitle">PDF Preview</span>
+        <span id="previewMeta" style="font-weight:400; text-transform:none;"></span>
+      </div>
+      <div class="preview-wrap" id="previewWrap">
+        <div class="empty">Select a PDF from the inbox to preview and review its recommended folder.</div>
+      </div>
+    </section>
+
+    <section class="col">
+      <div class="col-header">
+        <span>Recommendation &amp; Approval</span>
+        <span id="modelBadge" style="font-weight:400; text-transform:none;"></span>
+      </div>
+      <div class="scroll" id="recPane">
+        <div class="empty">No PDF selected.</div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast">
+    <span id="toastMsg"></span>
+    <button id="toastUndo" style="display:none;">Undo</button>
+  </div>
+
+  <div class="modal-backdrop" id="historyModal">
+    <div class="modal">
+      <div class="col-header">
+        <span>Recent Filing History</span>
+        <button id="btnCloseHistory">Close</button>
+      </div>
+      <div class="scroll" id="historyList"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="rulesModal">
+    <div class="modal" style="width:min(780px,94vw); max-height:86vh;">
+      <div class="col-header">
+        <span>Filing Rules (Learned Preferences)</span>
+        <div style="display:flex; gap:8px;">
+          <button id="btnSuggestRules" class="accent">✨ Suggest from Overrides</button>
+          <button id="btnCloseRules">Close</button>
+        </div>
+      </div>
+      <div class="scroll" id="rulesList"></div>
+      <div class="rule-form">
+        <div style="font-size:12px; font-weight:600; color:var(--muted); margin-bottom:6px;">+ ADD NEW FILING RULE</div>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+          <input type="text" id="newRuleName" placeholder="Rule name (e.g. Auto Insurance Policies)" />
+          <input type="text" id="newRulePerson" placeholder="Person (optional, e.g. Alice, Bob)" />
+        </div>
+        <input type="text" id="newRuleWhen" style="margin-top:6px;" placeholder="When to apply (e.g. Auto insurance renewal summaries and policy ID cards)" />
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:6px;">
+          <input type="text" id="newRuleKeywords" placeholder="Cue keywords, comma-separated (e.g. auto insurance, policy)" />
+          <input type="text" id="newRuleFolder" class="mono" placeholder="Destination folder (supports {YEAR})" />
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <button class="primary" id="btnAddRule">Save Rule</button>
+          <span style="font-size:11.5px; color:var(--muted); align-self:center;">Tip: use <code>{YEAR}</code> in a folder path to auto-match the document year.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="pickerModal">
+    <div class="picker-modal">
+      <div class="col-header">
+        <span id="pickerTitle">Choose Destination Folder</span>
+        <button id="btnClosePicker">Cancel</button>
+      </div>
+      <div class="picker-crumbs" id="pickerCrumbs"></div>
+      <div class="picker-toolbar">
+        <input type="text" id="pickerFilter" placeholder="Filter folders here..." autocomplete="off" />
+        <button id="btnPickerUp">↑ Up</button>
+        <button id="btnPickerNew">+ New Subfolder</button>
+      </div>
+      <div class="picker-body">
+        <div class="picker-dirs" id="pickerDirs"></div>
+        <div class="picker-files" id="pickerFiles"></div>
+      </div>
+      <div class="picker-footer">
+        <div class="picker-selected" id="pickerSelectedLabel"></div>
+        <div style="display:flex; gap:8px;">
+          <button id="btnPickerCancel">Cancel</button>
+          <button class="primary" id="btnPickerSelect">Select This Folder</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      inbox: [],
+      folders: [],
+      selected: null,
+      rec: null,
+      chosenFolder: '',
+      chosenFilename: '',
+      loading: false,
+      lastMoveId: null,
+      batch: { running: false, total: 0, done: 0, failed: 0, current: null },
+      batchTimer: null,
+    };
+
+    const $ = id => document.getElementById(id);
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function fmtSize(b) {
+      if (b < 1024) return b + ' B';
+      if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+      return (b/(1024*1024)).toFixed(1) + ' MB';
+    }
+
+    let toastTimer = null;
+    function showToast(msg, undoId = null) {
+      $('toastMsg').textContent = msg;
+      state.lastMoveId = undoId;
+      $('toastUndo').style.display = undoId ? 'inline-flex' : 'none';
+      $('toast').classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => $('toast').classList.remove('show'), undoId ? 9000 : 4000);
+    }
+
+    async function api(path, opts = {}) {
+      const resp = await fetch(path, opts);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || resp.statusText);
+      return data;
+    }
+
+    async function loadAll(keepSelection = true) {
+      const [info, folders] = await Promise.all([api('/api/inbox'), api('/api/folders')]);
+      state.inbox = info.items || [];
+      state.folders = folders.folders || [];
+      if (info.batch) state.batch = info.batch;
+      const readyCount = state.inbox.filter(x => x.analyzed).length;
+      $('inboxCount').textContent = state.inbox.length
+        ? `${state.inbox.length} in inbox (${readyCount} ready)`
+        : '0 in inbox';
+      $('inboxPath').textContent = info.inboxDir || '';
+      if (info.targetRoot) {
+        const parts = info.targetRoot.split('/').filter(Boolean);
+        state.targetName = parts[parts.length - 1] || 'Documents';
+        $('targetLabel').textContent = state.targetName;
+        $('pickerTitle').textContent = `Choose Destination Folder in ${state.targetName}`;
+      }
+      updateAnalyzeAllButton();
+      renderInbox();
+      if (state.batch.running && !state.batchTimer) startBatchPolling();
+      if (keepSelection && state.selected && state.inbox.some(x => x.name === state.selected)) {
+        return;
+      }
+      if (state.inbox.length > 0) {
+        selectPdf(state.inbox[0].name);
+      } else {
+        state.selected = null;
+        state.rec = null;
+        $('previewTitle').textContent = 'PDF Preview';
+        $('previewMeta').textContent = '';
+        $('previewWrap').innerHTML = '<div class="empty">Inbox is empty! Drop a scan on your Doxie Pro to get started.</div>';
+        $('recPane').innerHTML = '<div class="empty">All caught up.</div>';
+        $('modelBadge').textContent = '';
+      }
+    }
+
+    function updateAnalyzeAllButton() {
+      const btn = $('btnAnalyzeAll');
+      const unanalyzed = state.inbox.filter(x => !x.analyzed).length;
+      if (state.batch && state.batch.running) {
+        btn.className = 'danger';
+        btn.disabled = false;
+        btn.innerHTML = `<span class="spinner"></span> Analyzing ${state.batch.done}/${state.batch.total} · Stop`;
+      } else if (unanalyzed > 0) {
+        btn.className = 'accent';
+        btn.disabled = false;
+        btn.textContent = `⚡ Analyze All (${unanalyzed})`;
+      } else {
+        btn.className = '';
+        btn.disabled = state.inbox.length === 0;
+        btn.textContent = state.inbox.length ? '✓ All Analyzed' : '⚡ Analyze All';
+      }
+    }
+
+    function startBatchPolling() {
+      if (state.batchTimer) clearInterval(state.batchTimer);
+      state.batchTimer = setInterval(async () => {
+        try {
+          const info = await api('/api/inbox');
+          const wasRunning = state.batch.running;
+          state.inbox = info.items || [];
+          state.batch = info.batch || { running: false, total: 0, done: 0, failed: 0, current: null };
+          const readyCount = state.inbox.filter(x => x.analyzed).length;
+          $('inboxCount').textContent = state.inbox.length
+            ? `${state.inbox.length} in inbox (${readyCount} ready)`
+            : '0 in inbox';
+          updateAnalyzeAllButton();
+          renderInbox();
+          if (!state.batch.running) {
+            clearInterval(state.batchTimer);
+            state.batchTimer = null;
+            if (wasRunning) {
+              showToast(`Finished analyzing inbox (${readyCount}/${state.inbox.length} ready)`);
+            }
+          }
+        } catch (_) {}
+      }, 1200);
+    }
+
+    function renderInbox() {
+      const el = $('inboxList');
+      if (!state.inbox.length) {
+        el.innerHTML = '<div class="empty">No PDFs in inbox.</div>';
+        return;
+      }
+      el.innerHTML = state.inbox.map(item => {
+        const isCurrentBatch = state.batch && state.batch.running && state.batch.current === item.name;
+        let statusHtml = '';
+        if (isCurrentBatch) {
+          statusHtml = `<div class="inbox-status"><span class="analyzing"><span class="spinner" style="width:10px;height:10px;"></span> Analyzing…</span></div>`;
+        } else if (item.analyzed) {
+          const hint = item.recommendedFolder ? item.recommendedFolder.split('/').slice(-2).join('/') : 'Ready';
+          statusHtml = `<div class="inbox-status"><span class="ready">✓</span><span class="folder-hint" title="${esc(item.recommendedFolder || '')}">${esc(hint)}</span></div>`;
+        } else {
+          statusHtml = `<div class="inbox-status"><span>Not analyzed yet</span></div>`;
+        }
+        return `
+        <div class="inbox-item ${item.name === state.selected ? 'active' : ''}" data-name="${esc(item.name)}">
+          <div class="inbox-name">${esc(item.name)}</div>
+          <div class="inbox-meta">
+            <span>${item.pageCount ? item.pageCount + ' pg' : 'PDF'} · ${fmtSize(item.sizeBytes)}</span>
+            <span>${new Date(item.modifiedAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
+          </div>
+          ${statusHtml}
+        </div>
+      `;
+      }).join('');
+      el.querySelectorAll('.inbox-item').forEach(node => {
+        node.onclick = () => selectPdf(node.dataset.name);
+      });
+    }
+
+    async function selectPdf(name, tier = 'fast', force = false) {
+      state.selected = name;
+      state.rec = null;
+      renderInbox();
+      const item = state.inbox.find(x => x.name === name);
+      $('previewTitle').textContent = name;
+      $('previewMeta').textContent = item ? `${item.pageCount || '?'} pages · ${fmtSize(item.sizeBytes)}` : '';
+      $('previewWrap').innerHTML = `<iframe class="pdf-frame" src="/api/pdf?name=${encodeURIComponent(name)}#view=FitH"></iframe>`;
+      $('modelBadge').textContent = tier === 'strong' ? 'Analyzing (27B)...' : 'Analyzing (4B)...';
+      $('recPane').innerHTML = `<div class="empty"><span class="spinner"></span><br><br>Reading PDF text &amp; consulting local LLM (${tier === 'strong' ? 'qwen3.8-27b' : 'qwen3.5-4b'})…<br><small>First load may take a few seconds while LM Studio loads the model.</small></div>`;
+
+      try {
+        const rec = await api('/api/recommend', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, tier, force}),
+        });
+        if (state.selected !== name) return;
+        state.rec = rec;
+        state.chosenFolder = rec.recommended_folder || '';
+        state.chosenFilename = rec.suggested_filename || name;
+        const inboxEntry = state.inbox.find(x => x.name === name);
+        if (inboxEntry && !rec.fallback) {
+          inboxEntry.analyzed = true;
+          inboxEntry.recommendedFolder = rec.recommended_folder;
+          inboxEntry.confidence = rec.confidence;
+          const readyCount = state.inbox.filter(x => x.analyzed).length;
+          $('inboxCount').textContent = `${state.inbox.length} in inbox (${readyCount} ready)`;
+          updateAnalyzeAllButton();
+          renderInbox();
+        }
+        renderRec();
+      } catch (err) {
+        $('recPane').innerHTML = `<div class="empty" style="color:var(--red);">Error: ${esc(err.message)}</div>`;
+      }
+    }
+
+    function renderRec() {
+      const r = state.rec;
+      if (!r) return;
+      $('modelBadge').textContent = `${r.model || ''}${r.used_vision ? ' · 👁 Vision' : ''}${r.cached ? ' (cached)' : ''}`;
+      const options = [
+        {folder: r.recommended_folder, is_new_folder: r.is_new_folder, why: 'Primary recommendation', primary: true},
+        ...(r.alternatives || []),
+      ];
+
+      $('recPane').innerHTML = `
+        <div class="card">
+          <h3>
+            <span>Document Understanding</span>
+            <span class="pill ${esc(r.confidence)}">${esc(r.confidence)} confidence</span>
+          </h3>
+          <div class="summary">${esc(r.summary || '')}</div>
+          <div class="chips">
+            ${r.person ? `<span class="pill">Person: ${esc(r.person)}</span>` : ''}
+            ${r.vendor_or_source ? `<span class="pill">Source: ${esc(r.vendor_or_source)}</span>` : ''}
+            ${r.document_type ? `<span class="pill">Type: ${esc(r.document_type)}</span>` : ''}
+            ${r.document_date ? `<span class="pill">Date: ${esc(r.document_date)}</span>` : ''}
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>
+            <span>Why this location?</span>
+            ${r.matched_rule ? `<span class="pill new">★ Rule: ${esc(r.matched_rule)}</span>` : ''}
+          </h3>
+          <div class="why-box">${esc(r.why || '')}</div>
+          ${r.llm_error ? `<div style="margin-top:8px;color:var(--amber);font-size:12px;">LLM note: ${esc(r.llm_error)}</div>` : ''}
+        </div>
+
+        <div class="card">
+          <h3><span>Recommended Folders</span></h3>
+          <div id="folderOptions">
+            ${options.map((opt, idx) => `
+              <div class="folder-opt ${opt.folder === state.chosenFolder ? 'selected' : ''}" data-folder="${esc(opt.folder)}">
+                <div class="folder-path">
+                  <span>${idx === 0 ? '★ ' : ''}${esc(opt.folder)}</span>
+                  ${opt.is_new_folder ? '<span class="pill new">NEW FOLDER</span>' : ''}
+                </div>
+                ${opt.why ? `<div class="folder-why">${esc(opt.why)}</div>` : ''}
+              </div>
+            `).join('')}
+          </div>
+
+          <div class="row-between" style="margin-top:10px;">
+            <label for="folderInput" style="margin:0;">Destination Folder (in ${esc(state.targetName || 'Target')})</label>
+            <button id="btnBrowseFolder" class="accent" style="padding:3px 9px;font-size:12px;">📁 Browse…</button>
+          </div>
+          <input type="text" id="folderInput" class="mono" style="margin-top:4px;" value="${esc(state.chosenFolder)}" autocomplete="off" />
+          <div class="search-results" id="folderSearchResults"></div>
+          ${(r.sibling_examples && r.sibling_examples.length) ? `<div class="siblings">Existing files in primary folder:<br>• ${r.sibling_examples.map(esc).join('<br>• ')}</div>` : ''}
+
+          <div class="row-between" style="margin-top:10px;">
+            <label for="filenameInput" style="margin:0;">Destination Filename</label>
+            <button id="btnKeepOrig" style="padding:2px 7px;font-size:11.5px;">Use original name</button>
+          </div>
+          <input type="text" id="filenameInput" value="${esc(state.chosenFilename)}" />
+
+          <div class="teach-box" id="teachBox">
+            <div style="font-size:12px; font-weight:600; color:#d2c4ff;">💡 You chose a different folder — teach Doxie Filer</div>
+            <label for="teachNote">Optional note (saved with this correction so future scans learn)</label>
+            <input type="text" id="teachNote" placeholder="e.g. Put insurance renewals or school forms like this here" />
+            <label style="display:flex; align-items:center; gap:7px; margin-top:8px; cursor:pointer; color:var(--text);">
+              <input type="checkbox" id="chkSaveRule" />
+              <span>Save as a permanent filing rule</span>
+            </label>
+            <div id="teachRuleExtra" style="display:none; margin-top:6px;">
+              <label for="teachKeywords">Cue keywords (comma-separated)</label>
+              <input type="text" id="teachKeywords" value="${esc(defaultKeywordsForRec(r))}" />
+            </div>
+          </div>
+
+          <div class="row">
+            <button class="primary" id="btnApprove" style="flex:1; justify-content:center;">Approve &amp; Move</button>
+          </div>
+          <div class="row">
+            <button class="accent" id="btnStrong">Re-analyze with 27B</button>
+            <button id="btnFast">Re-analyze (4B)</button>
+            <button class="danger" id="btnDelete" style="margin-left:auto;">Delete</button>
+          </div>
+        </div>
+      `;
+
+      const syncTeachVisibility = () => {
+        const cur = ($('folderInput')?.value || '').trim();
+        const isOverride = Boolean(cur && r.recommended_folder && cur !== r.recommended_folder);
+        const tb = $('teachBox');
+        if (tb) tb.classList.toggle('open', isOverride);
+      };
+      $('chkSaveRule').onchange = () => {
+        $('teachRuleExtra').style.display = $('chkSaveRule').checked ? 'block' : 'none';
+      };
+
+      $('folderOptions').querySelectorAll('.folder-opt').forEach(node => {
+        node.onclick = () => {
+          state.chosenFolder = node.dataset.folder;
+          $('folderInput').value = state.chosenFolder;
+          $('folderOptions').querySelectorAll('.folder-opt').forEach(n => n.classList.toggle('selected', n.dataset.folder === state.chosenFolder));
+          $('folderSearchResults').classList.remove('open');
+          syncTeachVisibility();
+        };
+      });
+
+      const fi = $('folderInput');
+      const resBox = $('folderSearchResults');
+      const updateSearch = () => {
+        const q = fi.value.trim().toLowerCase();
+        state.chosenFolder = fi.value.trim();
+        $('folderOptions').querySelectorAll('.folder-opt').forEach(n => n.classList.toggle('selected', n.dataset.folder === state.chosenFolder));
+        syncTeachVisibility();
+        if (!q) { resBox.classList.remove('open'); return; }
+        const parts = q.split(/\s+/);
+        const matches = state.folders.filter(f => parts.every(p => f.toLowerCase().includes(p))).slice(0, 25);
+        if (!matches.length) { resBox.classList.remove('open'); return; }
+        resBox.innerHTML = matches.map(m => `<div class="search-item" data-f="${esc(m)}">${esc(m)}</div>`).join('');
+        resBox.classList.add('open');
+        resBox.querySelectorAll('.search-item').forEach(item => {
+          item.onclick = () => {
+            state.chosenFolder = item.dataset.f;
+            fi.value = state.chosenFolder;
+            resBox.classList.remove('open');
+            syncTeachVisibility();
+          };
+        });
+      };
+      fi.oninput = updateSearch;
+      fi.onfocus = updateSearch;
+      $('btnBrowseFolder').onclick = () => openFolderPicker(state.chosenFolder);
+      syncTeachVisibility();
+
+      $('filenameInput').oninput = e => { state.chosenFilename = e.target.value; };
+      $('btnKeepOrig').onclick = () => {
+        state.chosenFilename = state.selected;
+        $('filenameInput').value = state.selected;
+      };
+      $('btnStrong').onclick = () => selectPdf(state.selected, 'strong', true);
+      $('btnFast').onclick = () => selectPdf(state.selected, 'fast', true);
+
+      $('btnApprove').onclick = async () => {
+        const folder = $('folderInput').value.trim();
+        const filename = $('filenameInput').value.trim();
+        if (!folder) { showToast('Please enter a destination folder.'); return; }
+        const userNote = ($('teachNote')?.value || '').trim();
+        const saveRule = Boolean($('chkSaveRule')?.checked);
+        const ruleKeywords = ($('teachKeywords')?.value || '').trim();
+        $('btnApprove').disabled = true;
+        try {
+          const moved = await api('/api/approve', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              name: state.selected,
+              folder,
+              filename,
+              recommendation: state.rec,
+              userNote,
+              saveRule,
+              ruleData: saveRule ? { keywords: ruleKeywords, when: userNote } : null,
+            }),
+          });
+          let extra = '';
+          if (moved.created_rule) {
+            extra = ` · Saved rule "${moved.created_rule.name}"`;
+            refreshRulesBadge();
+          } else if (moved.invalidated_cache_count > 0) {
+            extra = ` · Refreshed ${moved.invalidated_cache_count} similar cached PDF(s)`;
+          }
+          showToast(`Moved to ${moved.relative_folder}/${moved.filename}${extra}`, moved.id);
+          await loadAll(false);
+        } catch (err) {
+          showToast('Move failed: ' + err.message);
+          $('btnApprove').disabled = false;
+        }
+      };
+
+      $('btnDelete').onclick = async () => {
+        if (!confirm(`Permanently delete ${state.selected} from inbox? (Raw pages remain in ~/Scans/doxie)`)) return;
+        await api('/api/inbox/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: state.selected}),
+        });
+        showToast(`Deleted ${state.selected} from inbox`);
+        await loadAll(false);
+      };
+    }
+
+    async function doUndo(id) {
+      try {
+        const undone = await api('/api/undo', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({id}),
+        });
+        showToast(`Restored ${undone.original_filename} back to inbox`);
+        await loadAll(true);
+      } catch (err) {
+        showToast('Undo failed: ' + err.message);
+      }
+    }
+
+    $('toastUndo').onclick = () => state.lastMoveId && doUndo(state.lastMoveId);
+    $('btnRefresh').onclick = () => loadAll(true);
+    $('btnAnalyzeAll').onclick = async () => {
+      try {
+        if (state.batch && state.batch.running) {
+          state.batch = await api('/api/analyze-all/stop', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+          showToast('Stopping batch analysis after current file…');
+          updateAnalyzeAllButton();
+          return;
+        }
+        const status = await api('/api/analyze-all', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ tier: 'fast', force: false }),
+        });
+        state.batch = status;
+        updateAnalyzeAllButton();
+        renderInbox();
+        if (status.running) {
+          showToast(`Analyzing ${status.total} PDF${status.total === 1 ? '' : 's'} in the background…`);
+          startBatchPolling();
+        } else {
+          showToast('All inbox PDFs are already analyzed!');
+        }
+      } catch (err) {
+        showToast('Analyze All failed: ' + err.message);
+      }
+    };
+
+    $('btnHistory').onclick = async () => {
+      const data = await api('/api/history');
+      const items = data.items || [];
+      $('historyList').innerHTML = items.length ? items.map(e => `
+        <div class="history-item">
+          <div>
+            <div class="folder-path">${esc(e.relative_folder)}/${esc(e.filename)} ${e.undone ? '<span class="pill">UNDONE</span>' : ''}</div>
+            <div class="folder-why">${esc(e.summary || e.original_filename)} · ${new Date(e.timestamp).toLocaleString()}</div>
+          </div>
+          ${!e.undone ? `<button data-undo="${esc(e.id)}">Undo</button>` : ''}
+        </div>
+      `).join('') : '<div class="empty">No files moved yet.</div>';
+      $('historyList').querySelectorAll('button[data-undo]').forEach(btn => {
+        btn.onclick = async () => {
+          await doUndo(btn.dataset.undo);
+          $('historyModal').classList.remove('open');
+        };
+      });
+      $('historyModal').classList.add('open');
+    };
+    $('btnCloseHistory').onclick = () => $('historyModal').classList.remove('open');
+    $('historyModal').onclick = e => { if (e.target === $('historyModal')) $('historyModal').classList.remove('open'); };
+
+    const picker = { path: '', data: null };
+
+    async function loadPickerDir(relPath) {
+      let target = relPath || '';
+      let data = null;
+      // If starting at a proposed new subfolder that doesn't exist yet, walk up to nearest existing parent
+      while (true) {
+        try {
+          data = await api(`/api/browse?path=${encodeURIComponent(target)}`);
+          break;
+        } catch (err) {
+          if (!target) { showToast('Browse failed: ' + err.message); return; }
+          target = target.includes('/') ? target.slice(0, target.lastIndexOf('/')) : '';
+        }
+      }
+      picker.path = data.path || '';
+      picker.data = data;
+      $('pickerFilter').value = '';
+      renderPicker();
+    }
+
+    function renderPicker() {
+      const d = picker.data;
+      if (!d) return;
+      const q = $('pickerFilter').value.trim().toLowerCase();
+
+      $('pickerCrumbs').innerHTML = d.breadcrumbs.map((c, idx) => {
+        const isLast = idx === d.breadcrumbs.length - 1;
+        return `${idx > 0 ? '<span style="color:var(--muted);">/</span>' : ''}<span class="crumb ${isLast ? 'current' : ''}" data-p="${esc(c.path)}">${esc(c.label)}</span>`;
+      }).join('');
+      $('pickerCrumbs').querySelectorAll('.crumb:not(.current)').forEach(el => {
+        el.onclick = () => loadPickerDir(el.dataset.p);
+      });
+
+      $('btnPickerUp').disabled = d.parent === null;
+
+      const dirs = (d.dirs || []).filter(dir => !q || dir.name.toLowerCase().includes(q));
+      $('pickerDirs').innerHTML = dirs.length ? dirs.map(dir => `
+        <div class="picker-row" data-p="${esc(dir.path)}">
+          <span class="picker-row-name"><span>📁</span><span>${esc(dir.name)}</span></span>
+          <span class="picker-row-arrow">${dir.hasChildren ? '▸' : ''}</span>
+        </div>
+      `).join('') : '<div class="empty" style="padding:20px;">No subfolders here.</div>';
+
+      $('pickerDirs').querySelectorAll('.picker-row').forEach(el => {
+        el.onclick = () => loadPickerDir(el.dataset.p);
+      });
+
+      const files = d.files || [];
+      $('pickerFiles').innerHTML = `
+        <div style="font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px;">
+          Existing files here (${d.totalFiles || 0})
+        </div>
+        ${files.length
+          ? files.map(f => `<div style="font-family:ui-monospace,monospace; font-size:11.5px; color:#b8c4da; padding:3px 0; word-break:break-word;">• ${esc(f)}</div>`).join('')
+            + (d.totalFiles > files.length ? `<div style="font-size:11.5px; color:var(--muted); margin-top:6px;">…and ${d.totalFiles - files.length} more</div>` : '')
+          : '<div style="font-size:12px; color:var(--muted);">No files directly in this folder yet.</div>'}
+      `;
+
+      const displayPath = picker.path ? `${d.rootName}/${picker.path}` : `${d.rootName} (choose a subfolder)`;
+      $('pickerSelectedLabel').textContent = displayPath;
+      $('btnPickerSelect').disabled = !picker.path;
+      $('btnPickerSelect').textContent = picker.path ? `Select "${picker.path.split('/').pop()}"` : 'Select a subfolder';
+    }
+
+    async function openFolderPicker(initialPath) {
+      $('pickerModal').classList.add('open');
+      await loadPickerDir(initialPath || '');
+      $('pickerFilter').focus();
+    }
+
+    function defaultKeywordsForRec(r) {
+      const kws = [];
+      const add = v => {
+        if (!v) return;
+        const s = String(v).trim().toLowerCase();
+        if (s && !['unknown', 'receipt', 'scanned document'].includes(s) && !kws.includes(s)) kws.push(s);
+      };
+      add(r.vendor_or_source);
+      add(r.document_type);
+      (r.cues || []).slice(0, 4).forEach(add);
+      return kws.slice(0, 6).join(', ');
+    }
+
+    async function refreshRulesBadge() {
+      try {
+        const data = await api('/api/rules');
+        const enabled = (data.items || []).filter(r => r.enabled !== false).length;
+        $('btnRules').textContent = `Rules (${enabled})`;
+      } catch (_) {}
+    }
+
+    async function loadRulesModal(suggestions = null) {
+      const data = await api('/api/rules');
+      const items = data.items || [];
+      let html = '';
+      if (suggestions && suggestions.length) {
+        html += `<div style="padding:10px 12px; background:rgba(91,156,246,.1); border-bottom:1px solid var(--border);">
+          <div style="font-size:12px; font-weight:650; color:#b7d4ff; margin-bottom:6px;">✨ Suggested Rules from Your Past Overrides</div>
+          ${suggestions.map((s, idx) => `
+            <div class="rule-item" style="border-bottom:1px solid rgba(91,156,246,.2); padding:8px 0;">
+              <div>
+                <div class="folder-path">${esc(s.name)} → ${esc(s.folder)} <span class="pill">${s.override_count} override${s.override_count === 1 ? '' : 's'}</span></div>
+                <div class="folder-why">${esc(s.when)} · cues: ${esc((s.keywords || []).join(', '))}</div>
+              </div>
+              <button class="primary" data-accept-sug="${idx}">Accept</button>
+            </div>
+          `).join('')}
+        </div>`;
+      } else if (suggestions && suggestions.length === 0) {
+        html += `<div style="padding:10px 12px; color:var(--muted); border-bottom:1px solid var(--border);">No new uncovered override patterns found—your active rules already cover your past overrides!</div>`;
+      }
+
+      html += items.length ? items.map(r => `
+        <div class="rule-item ${r.enabled === false ? 'disabled' : ''}">
+          <div>
+            <div class="folder-path">
+              <span>${esc(r.name)}</span>
+              ${r.person ? `<span class="pill">Person: ${esc(r.person)}</span>` : ''}
+            </div>
+            <div class="folder-why" style="color:#a9c5f7; font-family:ui-monospace,monospace;">→ ${esc(r.folder)}</div>
+            <div class="folder-why">${esc(r.when || '')}</div>
+            ${(r.keywords && r.keywords.length) ? `<div class="folder-why">Cues: ${esc(r.keywords.join(', '))}</div>` : ''}
+          </div>
+          <div style="display:flex; gap:6px; flex-shrink:0;">
+            <button data-toggle-rule="${esc(r.id)}" data-enabled="${r.enabled === false ? '0' : '1'}">${r.enabled === false ? 'Enable' : 'Disable'}</button>
+            <button class="danger" data-del-rule="${esc(r.id)}">Delete</button>
+          </div>
+        </div>
+      `).join('') : '<div class="empty">No filing rules yet.</div>';
+
+      $('rulesList').innerHTML = html;
+
+      if (suggestions && suggestions.length) {
+        $('rulesList').querySelectorAll('button[data-accept-sug]').forEach(btn => {
+          btn.onclick = async () => {
+            const s = suggestions[Number(btn.dataset.acceptSug)];
+            await api('/api/rules', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify(s),
+            });
+            showToast(`Added rule "${s.name}"`);
+            refreshRulesBadge();
+            await loadRulesModal();
+            await loadAll(true);
+          };
+        });
+      }
+
+      $('rulesList').querySelectorAll('button[data-toggle-rule]').forEach(btn => {
+        btn.onclick = async () => {
+          const enabled = btn.dataset.enabled === '1';
+          await api('/api/rules/update', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ id: btn.dataset.toggleRule, enabled: !enabled }),
+          });
+          refreshRulesBadge();
+          await loadRulesModal();
+          await loadAll(true);
+        };
+      });
+
+      $('rulesList').querySelectorAll('button[data-del-rule]').forEach(btn => {
+        btn.onclick = async () => {
+          await api('/api/rules/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ id: btn.dataset.delRule }),
+          });
+          showToast('Rule deleted');
+          refreshRulesBadge();
+          await loadRulesModal();
+          await loadAll(true);
+        };
+      });
+    }
+
+    $('btnRules').onclick = async () => {
+      await loadRulesModal();
+      $('rulesModal').classList.add('open');
+    };
+    $('btnCloseRules').onclick = () => $('rulesModal').classList.remove('open');
+    $('rulesModal').onclick = e => { if (e.target === $('rulesModal')) $('rulesModal').classList.remove('open'); };
+    $('btnSuggestRules').onclick = async () => {
+      const data = await api('/api/rules/suggest');
+      await loadRulesModal(data.items || []);
+    };
+    $('btnAddRule').onclick = async () => {
+      const name = $('newRuleName').value.trim();
+      const when = $('newRuleWhen').value.trim();
+      const folder = $('newRuleFolder').value.trim();
+      const person = $('newRulePerson').value.trim();
+      const keywords = $('newRuleKeywords').value.split(',').map(s => s.trim()).filter(Boolean);
+      if (!folder || (!name && !when)) {
+        showToast('Enter at least a folder and rule name or description.');
+        return;
+      }
+      try {
+        await api('/api/rules', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ name: name || folder.split('/').pop(), when: when || name, folder, person: person || null, keywords }),
+        });
+        $('newRuleName').value = '';
+        $('newRuleWhen').value = '';
+        $('newRuleFolder').value = '';
+        $('newRulePerson').value = '';
+        $('newRuleKeywords').value = '';
+        showToast('Rule saved! Cached recommendations refreshed.');
+        refreshRulesBadge();
+        await loadRulesModal();
+        await loadAll(true);
+      } catch (err) {
+        showToast('Error: ' + err.message);
+      }
+    };
+
+    function applyPickedFolder(relPath) {
+      state.chosenFolder = relPath;
+      const fi = $('folderInput');
+      if (fi) {
+        fi.value = relPath;
+        fi.dispatchEvent(new Event('input'));
+      }
+      const opts = $('folderOptions');
+      if (opts) {
+        opts.querySelectorAll('.folder-opt').forEach(n => n.classList.toggle('selected', n.dataset.folder === relPath));
+      }
+      const resBox = $('folderSearchResults');
+      if (resBox) resBox.classList.remove('open');
+      $('pickerModal').classList.remove('open');
+    }
+
+    $('pickerFilter').oninput = renderPicker;
+    $('btnPickerUp').onclick = () => picker.data && picker.data.parent !== null && loadPickerDir(picker.data.parent);
+    $('btnPickerNew').onclick = () => {
+      const rootName = state.targetName || 'Documents';
+      const name = prompt(`New subfolder name inside ${picker.path ? rootName + '/' + picker.path : rootName}:`);
+      if (!name || !name.trim()) return;
+      const clean = name.trim().replace(/[\\/]+/g, '-');
+      const full = picker.path ? `${picker.path}/${clean}` : clean;
+      applyPickedFolder(full);
+      showToast(`Destination set to new folder: ${full} (created on Approve & Move)`);
+    };
+    $('btnPickerSelect').onclick = () => picker.path && applyPickedFolder(picker.path);
+    $('btnClosePicker').onclick = () => $('pickerModal').classList.remove('open');
+    $('btnPickerCancel').onclick = () => $('pickerModal').classList.remove('open');
+    $('pickerModal').onclick = e => { if (e.target === $('pickerModal')) $('pickerModal').classList.remove('open'); };
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        $('pickerModal').classList.remove('open');
+        $('historyModal').classList.remove('open');
+        $('rulesModal').classList.remove('open');
+      }
+    });
+
+    refreshRulesBadge();
+    loadAll(false);
+  </script>
+</body>
+</html>
+"""
+
+
+class FilerHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args) -> None:
+        sys.stderr.write(f"[doxie-filer] {self.address_string()} - {format % args}\n")
+
+    def send_json(self, status: int, payload: object) -> None:
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        return json.loads(raw.decode("utf-8"))
+
+    def resolve_inbox_pdf(self, name: str) -> Path:
+        cfg = core.get_config()
+        inbox: Path = cfg["inbox_dir"].resolve()
+        if not name or "/" in name or "\\" in name or name in (".", ".."):
+            raise ValueError("Invalid filename")
+        pdf = (inbox / name).resolve()
+        if pdf.parent != inbox or not pdf.is_file():
+            raise FileNotFoundError(f"PDF not found in inbox: {name}")
+        return pdf
+
+    def do_HEAD(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        cfg = core.get_config()
+
+        if parsed.path == "/":
+            raw = HTML_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+
+        if parsed.path == "/api/inbox":
+            items = core.list_inbox_pdfs(cfg["inbox_dir"])
+            for item in items:
+                cached = core.get_cached_recommendation(Path(item["path"]), cfg)
+                if cached:
+                    item["analyzed"] = True
+                    item["confidence"] = cached.get("confidence")
+                    item["recommendedFolder"] = cached.get("recommended_folder")
+                    item["model"] = cached.get("model")
+                else:
+                    item["analyzed"] = False
+            self.send_json(
+                200,
+                {
+                    "inboxDir": str(cfg["inbox_dir"]),
+                    "targetRoot": str(cfg["target_root"]),
+                    "items": items,
+                    "batch": BATCH.status(),
+                },
+            )
+            return
+
+        if parsed.path == "/api/analyze-all/status":
+            self.send_json(200, BATCH.status())
+            return
+
+        if parsed.path == "/api/folders":
+            folders = core.list_target_folders(cfg["target_root"], pruned=False, profile=cfg.get("profile"))
+            self.send_json(200, {"targetRoot": str(cfg["target_root"]), "folders": folders})
+            return
+
+        if parsed.path == "/api/browse":
+            qs = urllib.parse.parse_qs(parsed.query)
+            rel = (qs.get("path") or [""])[0]
+            try:
+                self.send_json(200, core.browse_folder(cfg["target_root"], rel, profile=cfg.get("profile")))
+            except Exception as exc:
+                self.send_json(400, {"error": str(exc)})
+            return
+
+        if parsed.path == "/api/history":
+            self.send_json(200, {"items": core.load_history(limit=50, include_undone=True)})
+            return
+
+        if parsed.path == "/api/rules":
+            self.send_json(200, {"items": core.load_rules()})
+            return
+
+        if parsed.path == "/api/rules/suggest":
+            self.send_json(200, {"items": core.suggest_rules_from_history()})
+            return
+
+        if parsed.path == "/api/pdf":
+            qs = urllib.parse.parse_qs(parsed.query)
+            name = (qs.get("name") or [""])[0]
+            try:
+                pdf = self.resolve_inbox_pdf(name)
+                data = pdf.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/pdf")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'inline; filename="{pdf.name}"')
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as exc:
+                self.send_json(404, {"error": str(exc)})
+            return
+
+        self.send_json(404, {"error": "Not found"})
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        cfg = core.get_config()
+        try:
+            body = self.read_json()
+        except Exception:
+            self.send_json(400, {"error": "Invalid JSON"})
+            return
+
+        try:
+            if parsed.path == "/api/recommend":
+                pdf = self.resolve_inbox_pdf(body.get("name", ""))
+                tier = body.get("tier", "fast")
+                force = bool(body.get("force", False))
+                rec = core.recommend_for_pdf(pdf, cfg=cfg, tier=tier, bypass_cache=force)
+                self.send_json(200, rec)
+                return
+
+            if parsed.path == "/api/analyze-all":
+                tier = body.get("tier", "fast")
+                force = bool(body.get("force", False))
+                status = BATCH.start(cfg, tier=tier, force=force)
+                self.send_json(202 if status.get("running") else 200, status)
+                return
+
+            if parsed.path == "/api/analyze-all/stop":
+                self.send_json(200, BATCH.stop())
+                return
+
+            if parsed.path == "/api/approve":
+                pdf = self.resolve_inbox_pdf(body.get("name", ""))
+                entry = core.approve_move(
+                    pdf,
+                    relative_folder=body.get("folder", ""),
+                    filename=body.get("filename", pdf.name),
+                    cfg=cfg,
+                    recommendation=body.get("recommendation"),
+                    user_note=body.get("userNote"),
+                    save_rule=bool(body.get("saveRule", False)),
+                    rule_data=body.get("ruleData"),
+                )
+                self.send_json(200, entry)
+                return
+
+            if parsed.path == "/api/rules":
+                kws = body.get("keywords")
+                if isinstance(kws, str):
+                    kws = [x.strip() for x in kws.split(",") if x.strip()]
+                rule = core.add_rule(
+                    name=body.get("name", ""),
+                    folder=body.get("folder", ""),
+                    when=body.get("when", ""),
+                    keywords=kws,
+                    person=body.get("person"),
+                    source="user",
+                )
+                self.send_json(200, rule)
+                return
+
+            if parsed.path == "/api/rules/update":
+                rule = core.update_rule(body.get("id", ""), body)
+                self.send_json(200, rule)
+                return
+
+            if parsed.path == "/api/rules/delete":
+                ok = core.delete_rule(body.get("id", ""))
+                self.send_json(200, {"deleted": ok})
+                return
+
+            if parsed.path == "/api/undo":
+                entry = core.undo_move(body.get("id"))
+                self.send_json(200, entry)
+                return
+
+            if parsed.path == "/api/inbox/delete":
+                pdf = self.resolve_inbox_pdf(body.get("name", ""))
+                pdf.unlink()
+                self.send_json(200, {"deleted": pdf.name})
+                return
+
+            self.send_json(404, {"error": "Not found"})
+        except Exception as exc:
+            self.send_json(400, {"error": str(exc)})
+
+
+def main() -> int:
+    cfg = core.get_config()
+    listen = cfg["listen_addr"]
+    host, _, port_s = listen.partition(":")
+    host = host or "127.0.0.1"
+    port = int(port_s or "8401")
+    server = ThreadingHTTPServer((host, port), FilerHandler)
+    print(f"doxie-filer-web listening on http://{host}:{port} (inbox={cfg['inbox_dir']}, target={cfg['target_root']})", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

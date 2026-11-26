@@ -1,0 +1,19 @@
+[Unit]
+Description=Doxie Pro DX400 Scanner Daemon and Web UI
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/doxie-scanner/env
+Environment=DOXIE_DATA_DIR=%h/Scans/doxie
+Environment=DOXIE_LISTEN_ADDR=127.0.0.1:8400
+Environment=DOXIE_BUTTON_DUPLEX=1
+Environment=DOXIE_BUTTON_AUTOCROP=0
+Environment=DOXIE_OCR_LANG=eng
+ExecStartPre=/usr/bin/mkdir -p %h/Scans/doxie
+ExecStart=%h/.local/bin/doxie-scanner-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
