@@ -12,6 +12,7 @@ rec-cache.json
 exported.json
 *.pdf
 *.png
+!docs/screenshots/*.png
 *.jpg
 *.jpeg
 .DS_Store

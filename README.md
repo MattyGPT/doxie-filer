@@ -8,6 +8,23 @@ Doxie Filer watches your scans inbox (from a **Doxie Pro DX400**, any network **
 
 ---
 
+## Screenshots
+
+### Side-by-Side Inbox Review & AI Recommendation
+Preview each scanned PDF right beside the local LLM's document summary, matched filing rule, plain-English **Why**, alternative folders, editable filename, and one-click **Approve & Move**.
+
+![Doxie Filer inbox review and AI recommendation](docs/screenshots/inbox-review.png)
+
+### Visual Folder Picker & Learned Filing Rules
+Drill down across your archive with breadcrumbs and live previews of existing files—or manage persistent rules (with `{YEAR}` templates and one-click **Suggest from Overrides**).
+
+<p align="center">
+  <img src="docs/screenshots/folder-picker.png" width="49%" alt="Visual Folder Picker dialog with breadcrumbs and subfolder navigation">
+  <img src="docs/screenshots/rules-manager.png" width="49%" alt="Learned Filing Rules manager with automatic override suggestions">
+</p>
+
+---
+
 ## Features
 
 - **Side-by-Side Web Inbox GUI (`doxie-filer-web`)**
