@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""Batch-analyze and standardize PDF filenames in place using local LM Studio (never moves files)."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import csv
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+for _p in (Path(__file__).resolve().parent.parent, Path.home() / ".local" / "share" / "doxie-filer"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+try:
+    from doxie_filer import core
+except ImportError:
+    import filer_core as core
+
+DEFAULT_SKIP_TOP_DIRS = {"Scans", "Camera Uploads"}
+
+# Already clean "YYYY-MM-DD Descriptive Title.pdf" (excluding generic scanner/timestamp names)
+CLEAN_ISO_RE = re.compile(r"^(19\d{2}|20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\s+(.+)\.pdf$", re.IGNORECASE)
+GENERIC_AFTER_DATE_RE = re.compile(
+    r"^(?:\d{2}[-:]\d{2}|doxie\b|scan\b|scn[_ -]|doc(?:ument)?\b|new\s*document|img[_ -]|untitled|canon|page\s*\d|sent\s+fax\s+[a-z0-9]{8,}|[\d_\-\s]+$)",
+    re.IGNORECASE,
+)
+
+# Human-written "YYYYMMDD Descriptive Title.pdf"
+COMPACT_YMD_RE = re.compile(r"^(19\d{2}|20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\s+(.+)\.pdf$", re.IGNORECASE)
+
+RENAME_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "pdf_rename_decision",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["rename", "keep"]},
+                "new_filename": {"type": "string"},
+                "document_date": {"type": ["string", "null"]},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "reason": {"type": "string"},
+            },
+            "required": ["action", "new_filename", "document_date", "confidence", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def sanitize_cross_platform_filename(name: str, fallback: str, max_len: int = 135) -> str:
+    name = (name or "").strip()
+    # Replace characters illegal on Linux/macOS/Windows (important for Resilio sync)
+    name = re.sub(r'[/\\:*?"<>|\x00-\x1f]+', "-", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if name.lower().endswith(".pdf"):
+        stem = name[:-4].strip(" .-")
+    else:
+        stem = name.strip(" .-")
+    if not stem:
+        return fallback
+    if len(stem) > max_len - 4:
+        stem = stem[: max_len - 4].rsplit(" ", 1)[0].strip(" .-") or stem[: max_len - 4].strip(" .-")
+    return stem + ".pdf"
+
+
+def is_already_clean_iso(filename: str) -> bool:
+    m = CLEAN_ISO_RE.match(filename)
+    if not m:
+        return False
+    rest = m.group(4).strip()
+    if len(rest) < 4 or not any(c.isalpha() for c in rest):
+        return False
+    if GENERIC_AFTER_DATE_RE.match(rest):
+        return False
+    # Reject raw auto-export slugs or cryptic hex/scanner suffixes
+    if re.match(r"^[a-z0-9_-]+$", rest) and ("_" in rest or "-" in rest) and " " not in rest:
+        return False
+    return True
+
+
+def try_compact_ymd_standardize(filename: str) -> str | None:
+    """If filename is 'YYYYMMDD Clear Human Title.pdf', standardize date to 'YYYY-MM-DD Clear Human Title.pdf'."""
+    m = COMPACT_YMD_RE.match(filename)
+    if not m:
+        return None
+    y, mo, d, rest = m.group(1), m.group(2), m.group(3), m.group(4).strip()
+    if len(rest) < 4 or not any(c.isalpha() for c in rest):
+        return None
+    if GENERIC_AFTER_DATE_RE.match(rest):
+        return None
+    # Reject cryptic single-word codes or long numeric strings
+    if len(re.findall(r"[A-Za-z]{2,}", rest)) < 1:
+        return None
+    if re.search(r"[0-9]{10,}", rest):
+        return None
+    return sanitize_cross_platform_filename(f"{y}-{mo}-{d} {rest}.pdf", filename)
+
+
+def collect_pdfs(root: Path, skip_top: set[str]) -> list[Path]:
+    root = root.resolve()
+    pdfs: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = Path(dirpath).relative_to(root)
+        if rel == Path("."):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in skip_top and not d.endswith(".app"))
+        else:
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and not d.endswith(".app") and not d.endswith("_files"))
+        for fn in sorted(filenames):
+            if fn.lower().endswith(".pdf") and not fn.startswith(".") and not fn.endswith((".!sync", ".rsls", ".tmp")):
+                pdfs.append(Path(dirpath) / fn)
+    return pdfs
+
+
+def build_rename_prompt(
+    rel_folder: str,
+    current_name: str,
+    doc_text: str,
+    profile: dict[str, Any],
+    use_vision: bool,
+) -> tuple[str, str]:
+    household = profile.get("household_description") or "a personal/family archive"
+    people = list((profile.get("people") or {}).keys())
+    people_hint = ", ".join(people) if people else "the relevant person"
+
+    sys_prompt = (
+        f"You are a careful document naming assistant organizing PDFs in {household}. "
+        "Your ONLY job is to decide whether a PDF's current filename should be KEPT or RENAMED to cleanly reflect its content. "
+        "Files are NEVER moved—they stay in their current folder.\n\n"
+        "Naming Rules:\n"
+        "1. KEEP (action='keep') if the current filename is ALREADY clear, descriptive, accurate to the PDF content, "
+        "and either starts with 'YYYY-MM-DD ' or is an undated reference/manual/book/brochure/warranty with a clean title.\n"
+        "2. RENAME (action='rename') if the current filename is a generic scanner name (Doxie, Doc, Scan, New Document, IMG, SCN, timestamps, random numbers/IDs), "
+        "vague/unhelpful (statement.pdf, receipt.pdf, Print Vehicle Details.pdf, Document.pdf), uses messy/inconsistent dates "
+        "(e.g. '10-Oct-2026', '05-19-2022', 'Scan2019-06-29_192721 ...', '20180703 ...'), or doesn't describe the content.\n"
+        "3. Format for renamed files:\n"
+        "   - With date: 'YYYY-MM-DD Vendor or Source - Short Description.pdf' or 'YYYY-MM-DD Short Description.pdf'\n"
+        f"   - Include ' - <Person>' ({people_hint}) at the end ONLY if the document is for one specific person AND that person's name is NOT already in the folder path.\n"
+        "   - Without a clear date in the document or filename: 'Vendor or Source - Short Description.pdf' (NEVER invent a fake date!).\n"
+        "   - Preserve helpful qualifiers from the existing filename (e.g. 'Signed', 'Paid', 'Draft', '(sold)', tax year, form number like W-2 / 1099-INT).\n"
+        "   - Keep filenames concise (typically 30-85 chars), Title Case, cross-platform safe (no / \\ : * ? \" < > |), ending in lowercase '.pdf'.\n"
+        "4. If the PDF is blank, unreadable, corrupted, or too ambiguous to name reliably, set confidence='low' and action='keep'.\n"
+        "5. Output ONLY valid JSON matching the schema."
+    )
+
+    if use_vision:
+        content_block = (
+            "The PDF has little or garbled OCR text (likely an image-only scan or handwriting). "
+            "Inspect the ATTACHED IMAGE of page 1 directly to read the document and decide its filename."
+        )
+    else:
+        content_block = f'EXTRACTED PDF TEXT (first pages):\n"""\n{doc_text}\n"""'
+
+    usr_prompt = (
+        f"Current folder: {rel_folder or '(root)'}\n"
+        f"Current filename: {current_name}\n\n"
+        f"{content_block}\n\n"
+        "Return JSON with: action ('rename'|'keep'), new_filename, document_date ('YYYY-MM-DD'|null), "
+        "confidence ('high'|'medium'|'low'), reason (1 concise sentence)."
+    )
+    return sys_prompt, usr_prompt
+
+
+def fast_pdftotext(pdf_path: Path, max_pages: int = 2, max_chars: int = 2800) -> str:
+    """Fast embedded-text extraction via pdftotext (skips slow Tesseract since we use Vision directly)."""
+    if not shutil.which("pdftotext"):
+        return ""
+    proc = subprocess.run(
+        ["pdftotext", "-l", str(max_pages), str(pdf_path), "-"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    text = (proc.stdout or "").strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[truncated]..."
+    return text
+
+
+def analyze_pdf_for_rename(
+    pdf_path: Path,
+    rel_folder: str,
+    cfg: dict[str, Any],
+    loaded_model: str,
+    tier: str = "fast",
+) -> dict[str, Any]:
+    profile = cfg.get("profile") or {}
+    doc_text = fast_pdftotext(pdf_path, max_pages=2, max_chars=2800)
+    use_vision = core.is_ocr_low_quality(doc_text)
+    page_b64 = core.render_page_image_b64(pdf_path, page=1, dpi=115) if use_vision else None
+    if page_b64 is None:
+        use_vision = False
+
+    if not use_vision and len(doc_text.strip()) < 20:
+        return {
+            "action": "keep",
+            "new_filename": pdf_path.name,
+            "document_date": None,
+            "confidence": "low",
+            "reason": "Unreadable PDF (no text extracted and page image could not be rendered).",
+            "used_vision": False,
+        }
+
+    sys_prompt, usr_prompt = build_rename_prompt(rel_folder, pdf_path.name, doc_text, profile, use_vision)
+    user_content: Any = (
+        [
+            {"type": "text", "text": usr_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{page_b64}"}},
+        ]
+        if (use_vision and page_b64)
+        else usr_prompt
+    )
+    payload = {
+        "model": loaded_model,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "response_format": RENAME_RESPONSE_FORMAT,
+        "reasoning_effort": "none" if tier == "fast" else "low",
+        "temperature": 0.1,
+        "max_tokens": 500 if tier == "fast" else 1400,
+    }
+    req = urllib.request.Request(
+        f"{cfg['lmstudio_url']}/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as he:
+        body_err = he.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"HTTP {he.code}: {body_err[:250]}") from None
+
+    content = raw["choices"][0]["message"].get("content") or ""
+    parsed = core.extract_json_object(content)
+    parsed["new_filename"] = sanitize_cross_platform_filename(parsed.get("new_filename", ""), pdf_path.name)
+    parsed["confidence"] = str(parsed.get("confidence", "low")).lower()
+    if parsed["confidence"] not in ("high", "medium", "low"):
+        parsed["confidence"] = "low"
+    parsed["action"] = "rename" if parsed.get("action") == "rename" else "keep"
+    parsed["used_vision"] = bool(use_vision and page_b64)
+    return parsed
+
+
+def safe_rename_in_place(src: Path, desired_name: str, dry_run: bool = False) -> Path:
+    """Rename src within its exact same parent directory, preventing overwrites (including case-insensitive collisions)."""
+    parent = src.parent
+    clean_name = sanitize_cross_platform_filename(desired_name, src.name)
+    if clean_name == src.name:
+        return src
+
+    # Build case-insensitive sibling set excluding src itself
+    siblings_lower = {
+        p.name.lower()
+        for p in parent.iterdir()
+        if p.resolve() != src.resolve()
+    }
+
+    target_name = clean_name
+    if target_name.lower() in siblings_lower:
+        stem = target_name[:-4]
+        for i in range(2, 1000):
+            cand = f"{stem} ({i}).pdf"
+            if cand.lower() not in siblings_lower:
+                target_name = cand
+                break
+
+    dest = parent / target_name
+    assert dest.parent.resolve() == src.parent.resolve(), "Refusing to move file across directories!"
+
+    if not dry_run:
+        if src.name.lower() == dest.name.lower() and src.name != dest.name:
+            # Case-only rename (e.g. .Pdf -> .pdf): two-step for cross-platform safety
+            tmp = parent / f".rename-tmp-{os.getpid()}-{src.name}"
+            os.rename(src, tmp)
+            os.rename(tmp, dest)
+        else:
+            os.rename(src, dest)
+    return dest
+
+
+def write_reports(
+    records: list[dict[str, Any]],
+    report_md: Path,
+    report_csv: Path,
+    log_path: Path,
+    dry_run: bool,
+    started_at: str,
+    root_name: str = "Archive",
+) -> None:
+    report_md.parent.mkdir(parents=True, exist_ok=True)
+    counts = collections.Counter(r.get("status", "unknown") for r in records)
+    vision_count = sum(1 for r in records if r.get("used_vision"))
+
+    by_top: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    for r in records:
+        rel_folder = r.get("rel_folder") or "(root)"
+        top = rel_folder.split("/", 1)[0]
+        by_top[top][r.get("status", "unknown")] += 1
+
+    # Write CSV
+    csv_tmp = report_csv.with_suffix(".csv.tmp")
+    fieldnames = [
+        "status", "rel_folder", "old_name", "new_name", "confidence",
+        "method", "used_vision", "document_date", "reason", "error", "old_path", "new_path",
+    ]
+    with csv_tmp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in records:
+            w.writerow(r)
+    os.replace(csv_tmp, report_csv)
+
+    # Write Markdown report
+    renamed = [r for r in records if r.get("status") in ("renamed", "renamed_date_std", "would_rename")]
+    review = [r for r in records if r.get("status") in ("skipped_low_confidence", "error")]
+    kept = [r for r in records if r.get("status") in ("kept_clean_iso", "kept_llm")]
+
+    mode_label = "DRY RUN (no files changed)" if dry_run else "LIVE RENAME IN PLACE"
+    lines = [
+        f"# {root_name} PDF Rename Report ({mode_label})",
+        "",
+        f"- **Started:** {started_at}",
+        f"- **Updated:** {dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"- **Total PDFs processed:** {len(records):,}",
+        f"- **Renamed by LLM:** {counts['renamed'] + counts['would_rename']:,}",
+        f"- **Date-standardized (`YYYYMMDD` → `YYYY-MM-DD`):** {counts['renamed_date_std']:,}",
+        f"- **Kept as-is (already clean ISO):** {counts['kept_clean_iso']:,}",
+        f"- **Kept as-is (LLM judged already clear):** {counts['kept_llm']:,}",
+        f"- **Skipped (low confidence — needs manual review):** {counts['skipped_low_confidence']:,}",
+        f"- **Errors:** {counts['error']:,}",
+        f"- **Vision-assisted scans (handwriting / image-only):** {vision_count:,}",
+        f"- **CSV export:** `{report_csv}`",
+        f"- **JSONL undo log:** `{log_path}`",
+        "",
+        "### Undo / Rollback",
+        "```bash",
+        f"doxie-rename --undo \"{log_path}\"",
+        "```",
+        "",
+        "## Summary by Top-Level Folder",
+        "",
+        "| Folder | Total | Renamed (LLM) | Date Std | Kept (ISO) | Kept (LLM) | Low Conf | Errors |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for top in sorted(by_top.keys()):
+        c = by_top[top]
+        tot = sum(c.values())
+        lines.append(
+            f"| `{top}` | {tot:,} | {c['renamed'] + c['would_rename']:,} | {c['renamed_date_std']:,} | "
+            f"{c['kept_clean_iso']:,} | {c['kept_llm']:,} | {c['skipped_low_confidence']:,} | {c['error']:,} |"
+        )
+
+    if review:
+        lines.extend([
+            "",
+            f"## Needs Manual Review ({len(review):,})",
+            "",
+            "| Folder | Filename | Status | Reason / Error |",
+            "|---|---|---|---|",
+        ])
+        for r in review:
+            msg = (r.get("error") or r.get("reason") or "").replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| `{r.get('rel_folder') or '(root)'}` | `{r['old_name']}` | {r['status']} | {msg} |")
+
+    lines.extend([
+        "",
+        f"## All Renamed Files ({len(renamed):,})",
+        "",
+    ])
+    by_folder: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    for r in renamed:
+        by_folder[r.get("rel_folder") or "(root)"].append(r)
+
+    for folder in sorted(by_folder.keys()):
+        lines.append(f"### `{folder}`")
+        lines.append("")
+        lines.append("| Old Filename | New Filename | Conf | Method | Reason |")
+        lines.append("|---|---|---|---|---|")
+        for r in by_folder[folder]:
+            old_n = r["old_name"].replace("|", "\\|")
+            new_n = r["new_name"].replace("|", "\\|")
+            reason = (r.get("reason") or "").replace("|", "\\|").replace("\n", " ")
+            meth = "vision" if r.get("used_vision") else (r.get("method") or "llm")
+            lines.append(f"| `{old_n}` | `{new_n}` | {r.get('confidence', '')} | {meth} | {reason} |")
+        lines.append("")
+
+    md_tmp = report_md.with_suffix(".md.tmp")
+    md_tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(md_tmp, report_md)
+
+
+def run_undo(log_path: Path, dry_run: bool = False) -> int:
+    if not log_path.is_file():
+        raise SystemExit(f"Error: log file not found: {log_path}")
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    renamed = [r for r in records if r.get("status") in ("renamed", "renamed_date_std") and r.get("old_path") and r.get("new_path")]
+    reverted = 0
+    skipped = 0
+    for r in reversed(renamed):
+        old_p = Path(r["old_path"])
+        new_p = Path(r["new_path"])
+        if not new_p.is_file():
+            print(f"SKIP (missing): {new_p}", file=sys.stderr)
+            skipped += 1
+            continue
+        if old_p.exists() and old_p.resolve() != new_p.resolve():
+            print(f"SKIP (target exists): {old_p}", file=sys.stderr)
+            skipped += 1
+            continue
+        if dry_run:
+            print(f"WOULD REVERT: {new_p.name} -> {old_p.name}")
+        else:
+            os.rename(new_p, old_p)
+        reverted += 1
+    print(f"{'Would revert' if dry_run else 'Reverted'} {reverted} files ({skipped} skipped).")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Analyze and rename PDFs in place across an archive using a local LLM.")
+    parser.add_argument("--root", help="Root folder to scan (default: DOXIE_TARGET_ROOT)")
+    parser.add_argument("--dry-run", action="store_true", help="Analyze and write report without renaming files")
+    parser.add_argument("--limit", type=int, help="Process at most N PDFs (for testing)")
+    parser.add_argument("--strong", action="store_true", help="Use strong model (DOXIE_FILER_MODEL_STRONG)")
+    parser.add_argument("--resume", help="Resume from an existing JSONL run log")
+    parser.add_argument(
+        "--report-dir",
+        default=str(core.STATE_DIR / "reports"),
+        help="Directory for reports & undo logs (default: ~/.local/share/doxie-scanner/reports)",
+    )
+    parser.add_argument("--undo", help="Revert all renames recorded in the given JSONL log file")
+    args = parser.parse_args()
+
+    if args.undo:
+        return run_undo(Path(args.undo).expanduser(), dry_run=args.dry_run)
+
+    cfg = core.get_config()
+    root_raw = Path(args.root).expanduser() if args.root else cfg["target_root"]
+    root_name = root_raw.name or "Archive"
+    root = root_raw.resolve()
+    report_dir = Path(args.report_dir).expanduser()
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    profile = cfg.get("profile") or {}
+    skip_top = set(DEFAULT_SKIP_TOP_DIRS)
+    for p in profile.get("prune_subtrees") or []:
+        if "/" not in p:
+            skip_top.add(p)
+
+    run_stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    started_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    records: list[dict[str, Any]] = []
+    done_paths: set[str] = set()
+
+    if args.resume:
+        log_path = Path(args.resume).expanduser()
+        stem = re.sub(r"^(?:resilio-)?rename-", "", log_path.stem)
+        report_md = report_dir / f"rename-report-{stem}.md"
+        report_csv = report_dir / f"rename-report-{stem}.csv"
+        if log_path.is_file():
+            for line in log_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                records.append(rec)
+                if rec.get("old_path"):
+                    done_paths.add(rec["old_path"])
+                if rec.get("new_path"):
+                    done_paths.add(rec["new_path"])
+        print(f"Resuming from {log_path} ({len(records)} already processed)", flush=True)
+    else:
+        suffix = f"{run_stamp}-dryrun" if args.dry_run else run_stamp
+        log_path = report_dir / f"rename-{suffix}.jsonl"
+        report_md = report_dir / f"rename-report-{suffix}.md"
+        report_csv = report_dir / f"rename-report-{suffix}.csv"
+
+    all_pdfs = collect_pdfs(root, skip_top)
+    todo = [p for p in all_pdfs if str(p) not in done_paths]
+    if args.limit:
+        todo = todo[: args.limit]
+
+    tier = "strong" if args.strong else "fast"
+    model_key = cfg["model_strong"] if tier == "strong" else cfg["model_fast"]
+    loaded_model = core.ensure_lmstudio_model(cfg, model_key)
+
+    total_all = len(records) + len(todo)
+    print(
+        f"doxie-rename starting ({'DRY RUN' if args.dry_run else 'LIVE'}): "
+        f"{len(todo):,} PDFs to process ({len(records):,} already done) | model={loaded_model}",
+        flush=True,
+    )
+    print(f"  Log:    {log_path}", flush=True)
+    print(f"  Report: {report_md}", flush=True)
+
+    t0 = time.time()
+    processed_this_run = 0
+
+    with log_path.open("a", encoding="utf-8") as log_f:
+        for pdf in todo:
+            processed_this_run += 1
+            idx = len(records) + 1
+            rel_folder = str(pdf.parent.relative_to(root))
+            if rel_folder == ".":
+                rel_folder = ""
+
+            rec: dict[str, Any] = {
+                "timestamp": dt.datetime.now().astimezone().isoformat(),
+                "rel_folder": rel_folder,
+                "old_name": pdf.name,
+                "new_name": pdf.name,
+                "old_path": str(pdf),
+                "new_path": str(pdf),
+                "status": "kept_clean_iso",
+                "method": "fast_iso",
+                "confidence": "high",
+                "document_date": None,
+                "used_vision": False,
+                "reason": "",
+                "error": None,
+            }
+
+            try:
+                # 1. Fast path: already clean "YYYY-MM-DD Descriptive Title.pdf"
+                if is_already_clean_iso(pdf.name):
+                    rec["status"] = "kept_clean_iso"
+                    rec["reason"] = "Already follows clean YYYY-MM-DD descriptive format."
+                else:
+                    # 2. Fast path: human-written "YYYYMMDD Descriptive Title.pdf" -> "YYYY-MM-DD Descriptive Title.pdf"
+                    std_ymd = try_compact_ymd_standardize(pdf.name)
+                    if std_ymd and std_ymd != pdf.name:
+                        dest = safe_rename_in_place(pdf, std_ymd, dry_run=args.dry_run)
+                        rec["new_name"] = dest.name
+                        rec["new_path"] = str(dest)
+                        rec["status"] = "would_rename" if args.dry_run else "renamed_date_std"
+                        rec["method"] = "date_std"
+                        rec["confidence"] = "high"
+                        rec["document_date"] = std_ymd[:10]
+                        rec["reason"] = "Standardized compact YYYYMMDD date prefix to YYYY-MM-DD while preserving descriptive title."
+                    else:
+                        # 3. Local LLM analysis (with automatic Vision fallback for image-only/handwritten scans)
+                        res = analyze_pdf_for_rename(pdf, rel_folder, cfg, loaded_model, tier=tier)
+                        rec["method"] = "llm_vision" if res.get("used_vision") else "llm"
+                        rec["used_vision"] = bool(res.get("used_vision"))
+                        rec["confidence"] = res.get("confidence", "low")
+                        rec["document_date"] = res.get("document_date")
+                        rec["reason"] = res.get("reason", "")
+
+                        if res["confidence"] == "low":
+                            rec["status"] = "skipped_low_confidence"
+                        elif res["action"] == "rename" and res["new_filename"] != pdf.name:
+                            dest = safe_rename_in_place(pdf, res["new_filename"], dry_run=args.dry_run)
+                            rec["new_name"] = dest.name
+                            rec["new_path"] = str(dest)
+                            rec["status"] = "would_rename" if args.dry_run else "renamed"
+                        else:
+                            rec["status"] = "kept_llm"
+            except Exception as exc:
+                rec["status"] = "error"
+                rec["error"] = str(exc)
+
+            records.append(rec)
+            log_f.write(json.dumps(rec) + "\n")
+            log_f.flush()
+
+            if rec["status"] in ("renamed", "renamed_date_std", "would_rename") or processed_this_run % 25 == 0 or processed_this_run == len(todo):
+                elapsed = time.time() - t0
+                rate = processed_this_run / max(elapsed, 0.01)
+                eta_min = (len(todo) - processed_this_run) / max(rate, 0.001) / 60.0
+                if rec["status"] in ("renamed", "renamed_date_std", "would_rename"):
+                    vis = " [vision]" if rec["used_vision"] else ""
+                    print(f"[{idx}/{total_all}] {rec['status']}{vis}: {rel_folder}/{rec['old_name']} -> {rec['new_name']}", flush=True)
+                else:
+                    print(f"[{idx}/{total_all}] {rec['status']} ({rate:.2f} pdf/s, ETA ~{eta_min:.1f}m): {rec['old_name']}", flush=True)
+
+            if processed_this_run % 100 == 0:
+                write_reports(records, report_md, report_csv, log_path, args.dry_run, started_at, root_name=root_name)
+
+    write_reports(records, report_md, report_csv, log_path, args.dry_run, started_at, root_name=root_name)
+    elapsed_min = (time.time() - t0) / 60.0
+    print(f"\nDONE in {elapsed_min:.1f} min! Report saved to:\n  {report_md}\n  {report_csv}\nUndo log:\n  {log_path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
