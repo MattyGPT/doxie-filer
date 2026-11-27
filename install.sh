@@ -11,10 +11,11 @@ CONF_DIR="${HOME}/.config/doxie-scanner"
 mkdir -p "$BIN_DIR" "$LIB_DIR" "$SYSTEMD_DIR" "$APPS_DIR" "$CONF_DIR"
 
 echo "Linking executables into ${BIN_DIR}..."
-chmod +x "${REPO_DIR}/bin/doxie" "${REPO_DIR}/bin/doxie-filer-web" "${REPO_DIR}/bin/doxie-auto-export"
+chmod +x "${REPO_DIR}/bin/doxie" "${REPO_DIR}/bin/doxie-filer-web" "${REPO_DIR}/bin/doxie-auto-export" "${REPO_DIR}/bin/doxie-rename"
 ln -sfn "${REPO_DIR}/bin/doxie" "${BIN_DIR}/doxie"
 ln -sfn "${REPO_DIR}/bin/doxie-filer-web" "${BIN_DIR}/doxie-filer-web"
 ln -sfn "${REPO_DIR}/bin/doxie-auto-export" "${BIN_DIR}/doxie-auto-export"
+ln -sfn "${REPO_DIR}/bin/doxie-rename" "${BIN_DIR}/doxie-rename"
 ln -sfn "${REPO_DIR}/doxie_filer/core.py" "${LIB_DIR}/filer_core.py"
 
 echo "Installing systemd user units..."

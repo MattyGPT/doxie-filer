@@ -41,6 +41,9 @@ Drill down across your archive with breadcrumbs and live previews of existing fi
 - **Searchable PDF Auto-Exporter (`doxie-auto-export`)**
   - Watches a local [`doxie-scanner`](https://github.com/andiapps-dev/doxie-scanner) daemon (including physical scanner button presses) **and** your incoming scans folder (e.g. Canon Scan-to-Folder over SMB/Resilio).
   - Generates 300 DPI searchable PDFs via ImageMagick + `pdftoppm` + Tesseract, names them `YYYY-MM-DD_HH-MM-SS_<detected-source>.pdf`, and sends desktop notifications.
+- **Batch Archive Renamer (`doxie-rename`)**
+  - Walks an existing document archive in place (never moves files across folders) to standardize generic scanner names (`Doxie ...`, `Doc ...`, `New Document ...`, `Scan...`) and inconsistent date formats (`YYYYMMDD` → `YYYY-MM-DD`) using your local LLM + automatic `👁 Vision` fallback.
+  - Skips low-confidence/unreadable PDFs, enforces cross-platform collision-safe filenames, supports `--dry-run` and `--resume`, exports full **Markdown + CSV reports**, and provides 1-command rollback (`doxie-rename --undo <log.jsonl>`).
 - **Full CLI (`doxie`)**
   - `doxie scan`, `doxie canon`, `doxie pdf`, `doxie ocr`, `doxie file`, `doxie analyze`, `doxie rules`, `doxie history`, `doxie undo`, `doxie gui`, `doxie filer`, `doxie status`, `doxie service`.
 
@@ -134,6 +137,11 @@ doxie undo
 # Scan from Doxie Pro or network eSCL scanner
 doxie scan -o ~/Documents/scan.pdf
 doxie canon --duplex                # Pull from configured eSCL scanner
+
+# Batch-rename existing PDFs in place across your archive (never moves files)
+doxie-rename --dry-run --limit 25   # Preview on a small sample first
+doxie-rename                        # Live run with Markdown + CSV report & undo log
+doxie-rename --undo <log.jsonl>     # Roll back all renames from a run
 ```
 
 ---
